@@ -1,0 +1,4 @@
+flask==3.1.*
+gunicorn==23.*
+selenium==4.*
+requests==2.*
