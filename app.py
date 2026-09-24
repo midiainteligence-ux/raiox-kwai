@@ -600,6 +600,9 @@ HTML = r"""<!doctype html>
   .marca { font: 700 24px/1 var(--display); letter-spacing: -0.02em; display: flex; align-items: center; gap: 10px; }
   .marca i { width: 13px; height: 13px; border-radius: 3px; background: var(--accent-ink); display: inline-block; transform: rotate(45deg); }
   .top small { color: var(--accent-ink); opacity: .85; font-size: 14px; }
+  .marca-bloco { display: grid; gap: 6px; }
+  .autoria { font-size: 13px; color: var(--accent-ink); opacity: .9; letter-spacing: .01em; }
+  .autoria b { font-weight: 600; opacity: 1; }
 
   /* entrada */
   .entrada { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px; display: grid; gap: 14px; }
@@ -695,9 +698,12 @@ HTML = r"""<!doctype html>
   th { font: 600 11.5px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); cursor: pointer; white-space: nowrap; user-select: none; }
   th.n, td.n { text-align: right; }
   th[aria-sort="ascending"]::after { content: " ↑"; } th[aria-sort="descending"]::after { content: " ↓"; }
-  td.t { max-width: 360px; }
-  td.t a { color: var(--ink); text-decoration: none; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  td.t a:hover { text-decoration: underline; }
+  td.t { max-width: 420px; }
+  td.t .t-tit { display: block; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.t .t-link { display: block; margin-top: 2px; font: 12px/1.4 var(--mono); color: var(--accent); text-decoration: none;
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.t a.t-link:hover { text-decoration: underline; }
+  td.t .t-link.vazio { color: var(--muted); }
   .vazio { color: var(--muted); }
 
   #dica { position: absolute; pointer-events: none; background: var(--ink); color: var(--bg); font-size: 12.5px; line-height: 1.4;
@@ -709,7 +715,10 @@ HTML = r"""<!doctype html>
 
 <div class="wrap">
   <header class="top">
-    <div class="marca"><i aria-hidden="true"></i>Raio-X Kwai</div>
+    <div class="marca-bloco">
+      <div class="marca"><i aria-hidden="true"></i>Raio-X Kwai</div>
+      <div class="autoria">Criado por <b>Carolina Campelo</b> · setembro de 2026</div>
+    </div>
     <small>Cole o link de qualquer perfil do Kwai e veja como a conta posta e engaja</small>
   </header>
 
@@ -1154,7 +1163,9 @@ function tabela(A) {
   });
   $('#linhas').innerHTML = rows.map(v => `<tr>
     <td class="mono" style="white-space:nowrap">${dataLonga(v.data)}</td>
-    <td class="t">${v.link ? `<a href="${esc(v.link)}" target="_blank" rel="noopener" title="${esc(v.titulo)}">${esc(v.titulo)}</a>` : esc(v.titulo)}</td>
+    <td class="t"><span class="t-tit" title="${esc(v.titulo)}">${esc(v.titulo)}</span>${v.link
+      ? `<a class="t-link" href="${esc(v.link)}" target="_blank" rel="noopener">${esc(v.link.replace(/^https?:\/\/(www\.)?/, ''))} ↗</a>`
+      : `<span class="t-link vazio">sem link (vídeo de exemplo)</span>`}</td>
     <td class="n">${v.views !== null ? nf(v.views) : '<span class="vazio">–</span>'}</td>
     <td class="n">${v.likes !== null ? nf(v.likes) : '<span class="vazio">–</span>'}</td>
     <td class="n">${v.coms !== null ? nf(v.coms) : '<span class="vazio">–</span>'}</td>
