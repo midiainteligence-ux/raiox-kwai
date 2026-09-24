@@ -153,9 +153,82 @@ return saida;
 """
 
 
-def montar_driver():
-    """Mesmo navegador do seu robô de links, que já funciona: modo CELULAR
-    (janela 430x900 + navegador Android)."""
+# Lê cada card da grade do perfil: o número de views (▷ 163 / ▷ 2.8K), o título
+# que aparece embaixo e, se existir, o ID do vídeo em algum link/atributo.
+# Não depende de <a href> (o Kwai nem sempre usa link nos cards).
+JS_VIEWS_GRADE = r"""
+const reNum = /^\d+(?:[.,]\d+)?\s*(?:[KkMmBb]|mil|mi|bi)?$/;
+const folhas = Array.from(document.querySelectorAll('body *')).filter(el =>
+  el.children.length === 0 && reNum.test((el.textContent || '').trim()));
+const ehNum = el => el.children.length === 0 && reNum.test((el.textContent || '').trim());
+const temMidia = el => el.querySelector('img,video,picture,canvas') ||
+  Array.from(el.querySelectorAll('*')).some(x => (getComputedStyle(x).backgroundImage || 'none') !== 'none');
+const idDe = el => {
+  for (let n = el, i = 0; n && i < 4; n = n.parentElement, i++) {
+    const nos = [n, ...n.querySelectorAll('a,[data-id],[data-photo-id],[data-photoid],img')];
+    for (const x of nos) for (const at of (x.attributes || [])) {
+      const m = String(at.value).match(/\/video\/(\d{8,})/) || (/id/i.test(at.name) && String(at.value).match(/^(\d{15,})$/));
+      if (m) return m[1];
+    }
+  }
+  return '';
+};
+const saida = [];
+for (const f of folhas) {
+  let card = f;
+  for (let i = 0; i < 8 && card.parentElement; i++) {
+    const pai = card.parentElement;
+    if (Array.from(pai.querySelectorAll('*')).filter(ehNum).length > 1) break;
+    card = pai;
+  }
+  if (!temMidia(card)) continue;                       // números do cabeçalho (seguidores etc.) ficam de fora
+  const linhas = (card.innerText || '').split('\n').map(s => s.trim()).filter(s => s && !reNum.test(s));
+  const titulo = linhas.sort((a, b) => b.length - a.length)[0] || '';
+  saida.push({views: f.textContent.trim(), titulo, id: idDe(card)});
+}
+return saida;
+"""
+
+
+def _norm_titulo(t):
+    import html as _h
+    import unicodedata
+    t = _h.unescape(t or "").lower()
+    t = unicodedata.normalize("NFKD", t)
+    t = "".join(c for c in t if c.isalnum() or c.isspace())
+    return " ".join(t.split())
+
+
+def casar_views(itens, cards_views):
+    """Liga cada vídeo ao número de views do card da grade: primeiro pelo ID
+    (quando o card tem), depois pelo começo do título/legenda."""
+    por_id = {c["id"]: c["views"] for c in cards_views if c.get("id")}
+    livres = [c for c in cards_views if c.get("titulo")]
+    usados = set()
+    for it in itens:
+        if it.get("visualizacoes") is not None:
+            continue
+        v = por_id.get(it["id_video"])
+        if v is None:
+            alvo = _norm_titulo(it.get("legenda") or it.get("titulo"))
+            if len(alvo) >= 6:
+                for k, c in enumerate(livres):
+                    if k in usados:
+                        continue
+                    t = _norm_titulo(c["titulo"])
+                    n = min(len(t), len(alvo), 40)
+                    if n >= 6 and t[:n] == alvo[:n]:
+                        v = c["views"]
+                        usados.add(k)
+                        break
+        n = contagem_para_int(v) if v is not None else None
+        if n is not None:
+            it["visualizacoes"], it["fonte_views"] = n, "grade"
+
+
+def montar_driver(desktop=False):
+    """Modo CELULAR (430x900 + Android) = mesmo do robô de links, que acha os IDs.
+    desktop=True abre como computador, layout em que a grade mostra ▷ views."""
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
@@ -165,12 +238,11 @@ def montar_driver():
     opcoes.add_argument("--no-sandbox")
     opcoes.add_argument("--disable-dev-shm-usage")
     opcoes.add_argument("--disable-gpu")
-    opcoes.add_argument("--window-size=430,900")
+    opcoes.add_argument("--window-size=1400,1000" if desktop else "--window-size=430,900")
     opcoes.add_argument(f"--user-data-dir=/tmp/chrome-perfil-{random.randint(1, 999999)}")
-    opcoes.add_argument(
-        "user-agent=Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-    )
+    opcoes.add_argument("user-agent=" + (HEADERS["User-Agent"] if desktop else
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"))
     for caminho in ("/usr/bin/google-chrome-stable", "/usr/bin/google-chrome",
                     "/usr/bin/chromium-browser", "/usr/bin/chromium"):
         if os.path.exists(caminho):
@@ -228,14 +300,35 @@ def extrair_info_perfil(texto, html):
     return info
 
 
+def _ler_cards_views(driver, acumulado, chaves):
+    try:
+        for c in driver.execute_script(JS_VIEWS_GRADE) or []:
+            chave = c.get("id") or _norm_titulo(c.get("titulo"))[:60]
+            if chave and chave not in chaves:
+                chaves.add(chave)
+                acumulado.append(c)
+    except Exception:
+        pass
+
+
+def _rolar(driver):
+    altura = driver.execute_script("return window.innerHeight;") or 900
+    for _ in range(6):
+        driver.execute_script(f"window.scrollBy(0, {altura // 2});")
+        driver.execute_script("window.dispatchEvent(new Event('scroll'));")
+        time.sleep(0.5)
+    time.sleep(3)
+
+
 def ler_grade_do_perfil(url_perfil, conta, max_videos, avisar):
-    """Pega os IDs dos vídeos com a MESMA lógica do seu robô de links (links na
-    tela + /video/ID e photoId no código-fonte da página), rolando em 6 passos.
-    Em paralelo, tenta ler o número de views de cada card (▷ 2.8K); se o card
-    não trouxer, a view vem depois da página do vídeo."""
+    """IDs: mesma lógica do robô de links (modo celular; links na tela + /video/ID
+    e photoId no código-fonte). VIEWS: só existem na grade do perfil (▷ 163), então
+    são lidas dos cards durante a rolagem; se o layout celular não mostrar, faz uma
+    passada no layout desktop só pra isso. Devolve (cards, info, cards_views)."""
     avisar("Abrindo o navegador…")
     driver = montar_driver()
-    ids, vistos, views_card, titulos, info = [], set(), {}, {}, {}
+    ids, vistos, info = [], set(), {}
+    cards_views, chaves = [], set()
     sem_novidade = 0
     try:
         avisar(f"Carregando o perfil @{conta}…")
@@ -256,15 +349,7 @@ def ler_grade_do_perfil(url_perfil, conta, max_videos, avisar):
             html = driver.page_source
             ids_html = re.findall(r"/video/(\d{8,})", html)
             ids_html += re.findall(r'"photoId"\s*:\s*"?(\d{8,})"?', html)
-
-            try:
-                for c in driver.execute_script(JS_LER_CARDS, conta) or []:
-                    if c.get("views_texto"):
-                        views_card.setdefault(c["id"], c["views_texto"])
-                    if c.get("titulo_grade"):
-                        titulos.setdefault(c["id"], c["titulo_grade"])
-            except Exception:
-                pass
+            _ler_cards_views(driver, cards_views, chaves)
 
             antes = len(ids)
             for vid in ids_dom + ids_html:
@@ -273,17 +358,13 @@ def ler_grade_do_perfil(url_perfil, conta, max_videos, avisar):
                     ids.append(vid)
             avisar(f"Rolando a grade: {len(ids)}/{max_videos} vídeo(s)")
             if len(ids) >= max_videos:
+                _rolar(driver)
+                _ler_cards_views(driver, cards_views, chaves)
                 break
             sem_novidade = sem_novidade + 1 if len(ids) == antes else 0
             if sem_novidade >= 8:
                 break
-
-            altura = driver.execute_script("return window.innerHeight;") or 900
-            for _ in range(6):
-                driver.execute_script(f"window.scrollBy(0, {altura // 2});")
-                driver.execute_script("window.dispatchEvent(new Event('scroll'));")
-                time.sleep(0.5)
-            time.sleep(3)
+            _rolar(driver)
 
         if "seguidores" not in info:
             try:
@@ -296,9 +377,30 @@ def ler_grade_do_perfil(url_perfil, conta, max_videos, avisar):
     finally:
         driver.quit()
 
-    cards = [{"id": v, "href": "", "views_texto": views_card.get(v, ""),
-              "titulo_grade": titulos.get(v, ""), "miniatura": ""} for v in ids[:max_videos]]
-    return cards, info
+    if ids and len(cards_views) < len(ids[:max_videos]) * 0.6:
+        avisar("Lendo as visualizações na grade do perfil…")
+        try:
+            d2 = montar_driver(desktop=True)
+            try:
+                d2.get(url_perfil)
+                time.sleep(4)
+                for _ in range(40):
+                    antes = len(cards_views)
+                    _ler_cards_views(d2, cards_views, chaves)
+                    avisar(f"Lendo as visualizações na grade: {min(len(cards_views), max_videos)}/{min(len(ids), max_videos)}")
+                    if len(cards_views) >= min(len(ids), max_videos):
+                        break
+                    if len(cards_views) == antes and _ > 3:
+                        break
+                    _rolar(d2)
+            finally:
+                d2.quit()
+        except Exception:
+            pass
+
+    cards = [{"id": v, "href": "", "views_texto": "", "titulo_grade": "", "miniatura": ""}
+             for v in ids[:max_videos]]
+    return cards, info, cards_views
 
 
 # ----------------------------------------------------------------------
@@ -428,8 +530,8 @@ def executar(job_id, url_perfil, conta, max_videos):
         with TRAVA:
             FILA.remove(job_id)
         try:
-            cards, info = ler_grade_do_perfil(url_perfil, conta, max_videos,
-                                              lambda m: _atualizar(job_id, mensagem=m))
+            cards, info, cards_views = ler_grade_do_perfil(url_perfil, conta, max_videos,
+                                                           lambda m: _atualizar(job_id, mensagem=m))
         finally:
             NAVEGADORES.release()
     except Exception as e:
@@ -472,15 +574,17 @@ def executar(job_id, url_perfil, conta, max_videos):
                 else:
                     for k in ("curtidas", "comentarios", "compartilhamentos", "data_publicacao", "legenda"):
                         item[k] = m[k]
-                    if item["visualizacoes"] is None and m["views_pagina"] is not None:
-                        item["visualizacoes"], item["fonte_views"] = m["views_pagina"], "página"
                     if not item["titulo"]:
                         item["titulo"] = (m["legenda"] or "")[:120]
                     item["estado"] = "ok"
                 feitos += 1
                 JOBS[job_id]["mensagem"] = f"Lendo os vídeos: {feitos}/{len(itens)}"
 
-    _atualizar(job_id, status="concluido", mensagem=f"Pronto: {len(itens)} vídeo(s) de @{conta}.")
+    with TRAVA:
+        casar_views(itens, cards_views)
+    sem_views = sum(1 for it in itens if it["visualizacoes"] is None)
+    aviso = f" ({sem_views} sem visualizações na grade)" if sem_views else ""
+    _atualizar(job_id, status="concluido", mensagem=f"Pronto: {len(itens)} vídeo(s) de @{conta}.{aviso}")
     with TRAVA:
         CACHE[(conta.lower(), max_videos)] = (time.time(), job_id)
 
