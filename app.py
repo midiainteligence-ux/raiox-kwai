@@ -153,79 +153,6 @@ return saida;
 """
 
 
-# Lê cada card da grade do perfil: o número de views (▷ 163 / ▷ 2.8K), o título
-# que aparece embaixo e, se existir, o ID do vídeo em algum link/atributo.
-# Não depende de <a href> (o Kwai nem sempre usa link nos cards).
-JS_VIEWS_GRADE = r"""
-const reNum = /^\d+(?:[.,]\d+)?\s*(?:[KkMmBb]|mil|mi|bi)?$/;
-const folhas = Array.from(document.querySelectorAll('body *')).filter(el =>
-  el.children.length === 0 && reNum.test((el.textContent || '').trim()));
-const ehNum = el => el.children.length === 0 && reNum.test((el.textContent || '').trim());
-const temMidia = el => el.querySelector('img,video,picture,canvas') ||
-  Array.from(el.querySelectorAll('*')).some(x => (getComputedStyle(x).backgroundImage || 'none') !== 'none');
-const idDe = el => {
-  for (let n = el, i = 0; n && i < 4; n = n.parentElement, i++) {
-    const nos = [n, ...n.querySelectorAll('a,[data-id],[data-photo-id],[data-photoid],img')];
-    for (const x of nos) for (const at of (x.attributes || [])) {
-      const m = String(at.value).match(/\/video\/(\d{8,})/) || (/id/i.test(at.name) && String(at.value).match(/^(\d{15,})$/));
-      if (m) return m[1];
-    }
-  }
-  return '';
-};
-const saida = [];
-for (const f of folhas) {
-  let card = f;
-  for (let i = 0; i < 8 && card.parentElement; i++) {
-    const pai = card.parentElement;
-    if (Array.from(pai.querySelectorAll('*')).filter(ehNum).length > 1) break;
-    card = pai;
-  }
-  if (!temMidia(card)) continue;                       // números do cabeçalho (seguidores etc.) ficam de fora
-  const linhas = (card.innerText || '').split('\n').map(s => s.trim()).filter(s => s && !reNum.test(s));
-  const titulo = linhas.sort((a, b) => b.length - a.length)[0] || '';
-  saida.push({views: f.textContent.trim(), titulo, id: idDe(card)});
-}
-return saida;
-"""
-
-
-def _norm_titulo(t):
-    import html as _h
-    import unicodedata
-    t = _h.unescape(t or "").lower()
-    t = unicodedata.normalize("NFKD", t)
-    t = "".join(c for c in t if c.isalnum() or c.isspace())
-    return " ".join(t.split())
-
-
-def casar_views(itens, cards_views):
-    """Liga cada vídeo ao número de views do card da grade: primeiro pelo ID
-    (quando o card tem), depois pelo começo do título/legenda."""
-    por_id = {c["id"]: c["views"] for c in cards_views if c.get("id")}
-    livres = [c for c in cards_views if c.get("titulo")]
-    usados = set()
-    for it in itens:
-        if it.get("visualizacoes") is not None:
-            continue
-        v = por_id.get(it["id_video"])
-        if v is None:
-            alvo = _norm_titulo(it.get("legenda") or it.get("titulo"))
-            if len(alvo) >= 6:
-                for k, c in enumerate(livres):
-                    if k in usados:
-                        continue
-                    t = _norm_titulo(c["titulo"])
-                    n = min(len(t), len(alvo), 40)
-                    if n >= 6 and t[:n] == alvo[:n]:
-                        v = c["views"]
-                        usados.add(k)
-                        break
-        n = contagem_para_int(v) if v is not None else None
-        if n is not None:
-            it["visualizacoes"], it["fonte_views"], it["views_grade_texto"] = n, "grade", v
-
-
 def montar_driver(desktop=False):
     """Modo CELULAR (430x900 + Android) = mesmo do robô de links, que acha os IDs.
     desktop=True abre como computador, layout em que a grade mostra ▷ views."""
@@ -300,17 +227,6 @@ def extrair_info_perfil(texto, html):
     return info
 
 
-def _ler_cards_views(driver, acumulado, chaves):
-    try:
-        for c in driver.execute_script(JS_VIEWS_GRADE) or []:
-            chave = c.get("id") or _norm_titulo(c.get("titulo"))[:60]
-            if chave and chave not in chaves:
-                chaves.add(chave)
-                acumulado.append(c)
-    except Exception:
-        pass
-
-
 def _rolar(driver):
     altura = driver.execute_script("return window.innerHeight;") or 900
     for _ in range(6):
@@ -322,13 +238,10 @@ def _rolar(driver):
 
 def ler_grade_do_perfil(url_perfil, conta, max_videos, avisar):
     """IDs: mesma lógica do robô de links (modo celular; links na tela + /video/ID
-    e photoId no código-fonte). VIEWS: só existem na grade do perfil (▷ 163), então
-    são lidas dos cards durante a rolagem; se o layout celular não mostrar, faz uma
-    passada no layout desktop só pra isso. Devolve (cards, info, cards_views)."""
+    e photoId no código-fonte). Devolve (cards, info)."""
     avisar("Abrindo o navegador…")
     driver = montar_driver()
     ids, vistos, info = [], set(), {}
-    cards_views, chaves = [], set()
     sem_novidade = 0
     try:
         avisar(f"Carregando o perfil @{conta}…")
@@ -374,30 +287,9 @@ def ler_grade_do_perfil(url_perfil, conta, max_videos, avisar):
     finally:
         driver.quit()
 
-    if ids:
-        avisar("Lendo as visualizações (▷) na grade do perfil…")
-        try:
-            d2 = montar_driver(desktop=True)
-            try:
-                d2.get(url_perfil)
-                time.sleep(4)
-                for _ in range(40):
-                    antes = len(cards_views)
-                    _ler_cards_views(d2, cards_views, chaves)
-                    avisar(f"Lendo as visualizações na grade: {min(len(cards_views), max_videos)}/{min(len(ids), max_videos)}")
-                    if len(cards_views) >= min(len(ids), max_videos):
-                        break
-                    if len(cards_views) == antes and _ > 3:
-                        break
-                    _rolar(d2)
-            finally:
-                d2.quit()
-        except Exception:
-            pass
-
     cards = [{"id": v, "href": "", "views_texto": "", "titulo_grade": "", "miniatura": ""}
              for v in ids[:max_videos]]
-    return cards, info, cards_views
+    return cards, info
 
 
 # ----------------------------------------------------------------------
@@ -431,34 +323,48 @@ def _url_video(html):
 
 
 def _data_publicacao(html, video_id):
+    """Devolve (data AAAA-MM-DD, hora 0-23 em Brasília ou None, fonte).
+    Procura o horário mais próximo do ID do vídeo (a página traz outros vídeos).
+    A hora só vem de timestamp (fuso conhecido)."""
     candidatos = []
     p_hora = re.compile(r'\btime"?\s*:\s*"(\d{4}-\d{2}-\d{2})\s+\d{2}:\d{2}:\d{2}"')
-    p_ts = re.compile(r'\btimestamp"?\s*:\s*(\d{10,13})\b')
+    p_ts = re.compile(r'\b(?:timestamp|createTime|create_time|publishTime)"?\s*:\s*"?(\d{10,13})\b')
     for m_id in re.finditer(re.escape(video_id), html):
         ini = max(0, m_id.start() - 800)
         janela = html[ini:m_id.end() + 800]
         pos = m_id.start() - ini
         for m in p_hora.finditer(janela):
-            candidatos.append((abs(m.start() - pos), m.group(1)))
+            candidatos.append((abs(m.start() - pos), m.group(1), None))
         for m in p_ts.finditer(janela):
-            d = _ts_para_data(m.group(1))
-            if d:
-                candidatos.append((abs(m.start() - pos), d))
+            v = int(m.group(1))
+            v = v / 1000 if v > 10**12 else v
+            try:
+                dt = datetime.fromtimestamp(v, tz=FUSO_BR)
+            except (ValueError, OSError, OverflowError):
+                continue
+            if 2015 <= dt.year <= 2100:
+                candidatos.append((abs(m.start() - pos) - 0.5, dt.strftime("%Y-%m-%d"), dt.hour))
     if candidatos:
-        return min(candidatos)[1], "html"
+        _, data, hora = min(candidatos, key=lambda c: c[0])
+        if hora is None:
+            com_hora = [c for c in candidatos if c[2] is not None and c[1] == data]
+            if com_hora:
+                hora = min(com_hora, key=lambda c: c[0])[2]
+        return data, hora, "html"
     url = _url_video(html)
     if url:
         m = re.search(r"/(\d{4})/(\d{2})/(\d{2})/\d{2}/", url)
         if m:
-            return "-".join(m.groups()), "cdn"
-    return "", ""
+            return "-".join(m.groups()), None, "cdn"
+    return "", None, ""
 
 
 def metricas_da_pagina(link, video_id):
     r = requests.get(link, headers=HEADERS, timeout=25)
     html = r.text
     out = {"curtidas": None, "comentarios": None, "compartilhamentos": None,
-           "views_pagina": None, "legenda": "", "data_publicacao": "", "fonte_data": ""}
+           "views_pagina": None, "legenda": "", "data_publicacao": "", "hora_publicacao": None,
+           "fonte_data": ""}
 
     legenda = _meta(html, "og:description") or ""
     out["legenda"] = legenda.strip()
@@ -488,7 +394,7 @@ def metricas_da_pagina(link, video_id):
                 out[campo] = int(m.group(1))
                 break
 
-    out["data_publicacao"], out["fonte_data"] = _data_publicacao(html, video_id)
+    out["data_publicacao"], out["hora_publicacao"], out["fonte_data"] = _data_publicacao(html, video_id)
     return out
 
 
@@ -527,8 +433,8 @@ def executar(job_id, url_perfil, conta, max_videos):
         with TRAVA:
             FILA.remove(job_id)
         try:
-            cards, info, cards_views = ler_grade_do_perfil(url_perfil, conta, max_videos,
-                                                           lambda m: _atualizar(job_id, mensagem=m))
+            cards, info = ler_grade_do_perfil(url_perfil, conta, max_videos,
+                                              lambda m: _atualizar(job_id, mensagem=m))
         finally:
             NAVEGADORES.release()
     except Exception as e:
@@ -551,7 +457,7 @@ def executar(job_id, url_perfil, conta, max_videos):
                       "titulo": c["titulo_grade"], "visualizacoes": views,
                       "fonte_views": "grade" if views is not None else "",
                       "curtidas": None, "comentarios": None, "compartilhamentos": None,
-                      "data_publicacao": "", "legenda": "", "estado": "pendente"})
+                      "data_publicacao": "", "hora_publicacao": None, "legenda": "", "estado": "pendente"})
     _atualizar(job_id, itens=itens, perfil_info=info,
                mensagem=f"{len(itens)} vídeo(s) encontrados. Lendo os dados de cada um…")
 
@@ -569,7 +475,8 @@ def executar(job_id, url_perfil, conta, max_videos):
                 if erro:
                     item["estado"] = "erro"
                 else:
-                    for k in ("curtidas", "comentarios", "compartilhamentos", "data_publicacao", "legenda"):
+                    for k in ("curtidas", "comentarios", "compartilhamentos", "data_publicacao",
+                              "hora_publicacao", "legenda"):
                         item[k] = m[k]
                     if not item["titulo"]:
                         item["titulo"] = (m["legenda"] or "")[:120]
@@ -577,11 +484,7 @@ def executar(job_id, url_perfil, conta, max_videos):
                 feitos += 1
                 JOBS[job_id]["mensagem"] = f"Lendo os vídeos: {feitos}/{len(itens)}"
 
-    with TRAVA:
-        casar_views(itens, cards_views)
-    sem_views = sum(1 for it in itens if it["visualizacoes"] is None)
-    aviso = f" ({sem_views} sem visualizações na grade)" if sem_views else ""
-    _atualizar(job_id, status="concluido", mensagem=f"Pronto: {len(itens)} vídeo(s) de @{conta}.{aviso}")
+    _atualizar(job_id, status="concluido", mensagem=f"Pronto: {len(itens)} vídeo(s) de @{conta}.")
     with TRAVA:
         CACHE[(conta.lower(), max_videos)] = (time.time(), job_id)
 
@@ -717,12 +620,7 @@ HTML = r"""<!doctype html>
   .btn.pri { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
   .btn:hover { filter: brightness(1.06); }
   input:focus-visible, select:focus-visible, .btn:focus-visible, th:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .passos { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
-  .passo { background: var(--sunken); border-radius: 10px; padding: 12px 14px; font-size: 14px; color: var(--ink2); }
-  .passo b { display: block; color: var(--ink); font-weight: 600; margin-bottom: 2px; }
-  pre.cod { margin: 8px 0 0; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
             font: 12.5px/1.5 var(--mono); color: var(--ink); overflow-x: auto; white-space: pre; }
-  .cod-barra { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 8px; }
   [hidden] { display: none !important; }
   body { margin: 0; }
   .acao { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
@@ -732,12 +630,7 @@ HTML = r"""<!doctype html>
   @media (prefers-reduced-motion: reduce) { .spin { animation-duration: 3s; } }
   .barra { height: 4px; border-radius: 4px; background: var(--grid); overflow: hidden; }
   .barra i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
-  .csv-opc summary { cursor: pointer; font-size: 13.5px; color: var(--muted); }
-  .csv-opc .zona { margin-top: 10px; }
-  .zona { border: 1.5px dashed var(--line); border-radius: 10px; padding: 12px 14px; display: flex; align-items: center;
           gap: 12px; flex-wrap: wrap; color: var(--ink2); font-size: 14px; }
-  .zona.arrastando { border-color: var(--accent); background: var(--accent-soft); }
-  .zona input[type=file] { display: none; }
   .aviso { font-size: 13.5px; padding: 9px 12px; border-radius: 8px; background: var(--warn-soft); color: var(--ink); }
   .aviso b { color: var(--warn); }
   .erro { color: var(--err); font-size: 14px; }
@@ -774,16 +667,6 @@ HTML = r"""<!doctype html>
   .stats dd { margin: 0; font: 500 15px/1.3 var(--mono); }
   .stats dd small { font: 12px var(--body); color: var(--ink2); display: block; }
 
-  .taxa { display: grid; grid-template-columns: auto 1fr; gap: 18px; align-items: center; }
-  @media (max-width: 520px) { .taxa { grid-template-columns: 1fr; } }
-  .taxa-num { font: 600 44px/1 var(--display); letter-spacing: -0.03em; color: var(--accent); }
-  .taxa-num small { display: block; font: 13px/1.4 var(--body); color: var(--muted); letter-spacing: 0; margin-top: 6px; }
-  .pessoas { display: grid; grid-template-columns: repeat(20, 1fr); gap: 3px; max-width: 360px; }
-  .pessoas i { aspect-ratio: 1; border-radius: 50%; background: var(--grid); display: block; }
-  .pessoas i.on { background: var(--accent); }
-  .pessoas i.com { background: var(--hot); }
-  .legenda { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: var(--ink2); }
-  .legenda span::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; background: var(--c); vertical-align: 0; }
 
   .top5 { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
   .top5 li { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: baseline; font-size: 14px; padding-bottom: 8px; border-bottom: 1px solid var(--grid); }
@@ -806,13 +689,27 @@ HTML = r"""<!doctype html>
   td.t a.t-link:hover { text-decoration: underline; }
   td.t .t-link.vazio { color: var(--muted); }
   .vazio { color: var(--muted); }
-  .lido { display: block; font: 11px/1.3 var(--mono); color: var(--muted); }
 
   #dica { position: absolute; pointer-events: none; background: var(--ink); color: var(--bg); font-size: 12.5px; line-height: 1.4;
           padding: 7px 9px; border-radius: 8px; max-width: 260px; z-index: 5; transform: translate(-50%, calc(-100% - 10px)); }
   #dica b { font-family: var(--mono); font-weight: 500; }
   .nota { font-size: 12.5px; color: var(--muted); margin: 0; max-width: 80ch; }
   @media (prefers-reduced-motion: no-preference) { .kpi b, .laudo h1 { transition: color .2s; } }
+  /* v2 */
+  .insights { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px; display: grid; gap: 10px; }
+  .insights h2 { font: 600 17px/1.25 var(--display); margin: 0; }
+  .insights ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; }
+  .insights li { display: grid; grid-template-columns: 22px 1fr; gap: 8px; font-size: 15px; line-height: 1.45; color: var(--ink); }
+  .insights li::before { content: ""; width: 10px; height: 10px; margin-top: 6px; border-radius: 2px; background: var(--accent); transform: rotate(45deg); justify-self: center; }
+  .insights li b { font-weight: 600; }
+  .conclusao { margin: 0; font-size: 14.5px; color: var(--ink); background: var(--accent-soft); border-radius: 10px; padding: 10px 12px; }
+  .conclusao b { color: var(--hot); }
+  .grande { font: 600 44px/1 var(--display); letter-spacing: -0.03em; color: var(--accent); }
+  .grande small { display: block; font: 13px/1.4 var(--body); color: var(--muted); letter-spacing: 0; margin-top: 6px; max-width: 30ch; }
+  .seg-bloco { display: grid; grid-template-columns: auto 1fr; gap: 20px; align-items: center; }
+  @media (max-width: 560px) { .seg-bloco { grid-template-columns: 1fr; } }
+  .vezes { font: 500 13px/1 var(--mono); color: var(--hot); }
+  .hora { color: var(--muted); font-size: 12px; }
 </style>
 
 <div class="wrap">
@@ -821,19 +718,18 @@ HTML = r"""<!doctype html>
       <div class="marca"><i aria-hidden="true"></i>Raio-X Kwai</div>
       <div class="autoria">Criado por <b>Carolina Campelo</b> · setembro de 2026</div>
     </div>
-    <small>Cole o link de qualquer perfil do Kwai e veja como a conta posta e engaja</small>
+    <small>Cole o link de qualquer perfil do Kwai e veja quando a conta posta e quando engaja</small>
   </header>
 
-  <section class="entrada" aria-label="Carregar uma conta">
+  <section class="entrada" aria-label="Analisar um perfil">
     <div class="linha-form">
-      <input type="text" id="perfil" placeholder="Cole o link do perfil, ex.: https://www.kwai.com/@augustocuryoficial" autocomplete="off">
+      <input type="text" id="perfil" placeholder="Cole o link do perfil, ex.: https://www.kwai.com/@Lulaoficial" autocomplete="off">
       <select id="qtd" aria-label="Quantos vídeos analisar">
         <option value="20">Últimos 20</option>
         <option value="40" selected>Últimos 40</option>
         <option value="80">Últimos 80</option>
-        
       </select>
-      <input type="number" id="seg" min="0" placeholder="Seguidores" aria-label="Seguidores (opcional)">
+      <input type="number" id="seg" min="0" placeholder="Seguidores (opcional)" aria-label="Seguidores (opcional)">
     </div>
     <div class="acao">
       <button class="btn pri" type="button" id="analisar">Analisar perfil</button>
@@ -843,14 +739,6 @@ HTML = r"""<!doctype html>
     <div class="aviso" id="sem-robo" hidden>
       <b>O servidor de coleta não respondeu.</b> Atualize a página em alguns segundos e tente de novo.
     </div>
-    <details class="csv-opc">
-      <summary>Já tem um CSV da pasta Basedadosconteudo? Carregar arquivo</summary>
-      <label class="zona" id="zona">
-        <input type="file" id="arquivo" accept=".csv,text/csv">
-        <span class="btn">Escolher CSV</span>
-        <span id="zona-txt">ou arraste o arquivo para cá</span>
-      </label>
-    </details>
     <div id="msg" class="erro" hidden></div>
   </section>
 
@@ -863,6 +751,33 @@ HTML = r"""<!doctype html>
 
   <div class="kpis" id="kpis"></div>
 
+  <section class="insights">
+    <h2>O que levar pra conversa</h2>
+    <ul id="insights"></ul>
+  </section>
+
+  <div class="grade2">
+    <section class="painel">
+      <h2>Dia em que mais posta vs dia em que mais engaja</h2>
+      <p class="sub">Esquerda: quantos vídeos saíram em cada dia. Direita: interações medianas por vídeo publicado naquele dia (curtidas + comentários).</p>
+      <div class="grafico" id="g-dias"></div>
+      <p class="conclusao" id="c-dias"></p>
+    </section>
+    <section class="painel">
+      <h2>Horário em que mais posta vs horário em que mais engaja</h2>
+      <p class="sub">Mesma comparação, por faixa do dia (horário de Brasília).</p>
+      <div class="grafico" id="g-horas"></div>
+      <p class="conclusao" id="c-horas"></p>
+    </section>
+  </div>
+
+  <section class="painel">
+    <h2>Engajamento de cada vídeo ao longo do tempo</h2>
+    <p class="sub" id="sub-eng"></p>
+    <div class="grafico" id="g-eng"></div>
+    <dl class="stats" id="stats-eng"></dl>
+  </section>
+
   <div class="grade2">
     <section class="painel">
       <h2>Publicações por semana</h2>
@@ -871,41 +786,20 @@ HTML = r"""<!doctype html>
       <dl class="stats" id="stats-freq"></dl>
     </section>
     <section class="painel">
-      <h2>Em que dia a conta posta</h2>
-      <p class="sub">Quantos dos vídeos analisados saíram em cada dia da semana</p>
-      <div class="grafico" id="g-dias"></div>
+      <h2>Engajamento em relação aos seguidores</h2>
+      <p class="sub">Quanto da base de seguidores interage com um vídeo típico</p>
+      <div class="seg-bloco">
+        <div class="grande" id="seg-num"></div>
+        <dl class="stats" id="stats-seg"></dl>
+      </div>
     </section>
   </div>
 
   <section class="painel">
-    <h2>Visualizações de cada vídeo ao longo do tempo</h2>
-    <p class="sub" id="sub-views"></p>
-    <div class="grafico" id="g-views"></div>
+    <h2>Vídeos que mais engajaram</h2>
+    <p class="sub">Interações de cada vídeo comparadas com a mediana do perfil</p>
+    <ol class="top5" id="top-eng"></ol>
   </section>
-
-  <div class="grade2">
-    <section class="painel">
-      <h2>Chance de interagir por visualização</h2>
-      <p class="sub">De cada 100 pessoas que assistem, quantas curtem ou comentam</p>
-      <div class="taxa">
-        <div class="taxa-num" id="taxa-num"></div>
-        <div style="display:grid;gap:8px">
-          <div class="pessoas" id="pessoas" aria-hidden="true"></div>
-          <div class="legenda">
-            <span style="--c:var(--accent)">curtiu</span>
-            <span style="--c:var(--hot)">comentou</span>
-            <span style="--c:var(--grid)">só assistiu</span>
-          </div>
-        </div>
-      </div>
-      <dl class="stats" id="stats-eng"></dl>
-    </section>
-    <section class="painel">
-      <h2>Vídeos que mais engajaram</h2>
-      <p class="sub">Maior taxa de interação por view (vídeos com 100+ views)</p>
-      <ol class="top5" id="top-eng"></ol>
-    </section>
-  </div>
 
   <section class="painel" style="padding:0;border:0;background:none">
     <h2>Todos os vídeos analisados</h2>
@@ -914,10 +808,11 @@ HTML = r"""<!doctype html>
         <thead><tr>
           <th data-k="data" tabindex="0">Publicado</th>
           <th data-k="titulo" tabindex="0">Vídeo</th>
-          <th data-k="views" class="n" tabindex="0">Views</th>
           <th data-k="likes" class="n" tabindex="0">Curtidas</th>
           <th data-k="coms" class="n" tabindex="0">Coment.</th>
-          <th data-k="taxa" class="n" tabindex="0">Interação/view</th>
+          <th data-k="int" class="n" tabindex="0">Interações</th>
+          <th data-k="rel" class="n" tabindex="0">vs mediana</th>
+          <th data-k="pseg" class="n" tabindex="0">% seguidores</th>
         </tr></thead>
         <tbody id="linhas"></tbody>
       </table>
@@ -932,11 +827,11 @@ HTML = r"""<!doctype html>
 const $ = s => document.querySelector(s);
 const DIA = 864e5;
 const DIAS_CURTO = ['seg', 'ter', 'qua', 'qui', 'sex', 'sáb', 'dom'];
-const DIAS_LONGO = ['segunda', 'terça', 'quarta', 'quinta', 'sexta', 'sábado', 'domingo'];
+const DIAS_NOS = ['às segundas', 'às terças', 'às quartas', 'às quintas', 'às sextas', 'aos sábados', 'aos domingos'];
+const FAIXAS = [{rot: 'madrug.', nome: 'de madrugada', ini: 0}, {rot: 'manhã', nome: 'de manhã', ini: 6},
+                {rot: 'tarde', nome: 'à tarde', ini: 12}, {rot: 'noite', nome: 'à noite', ini: 18}];
 const MESES = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-
-// ---------- formatação pt-BR ----------
 const nf = (n, d = 0) => Number(n).toLocaleString('pt-BR', {maximumFractionDigits: d, minimumFractionDigits: 0});
 function compacto(n) {
   if (n === null || n === undefined || !isFinite(n)) return '–';
@@ -946,188 +841,178 @@ function compacto(n) {
   if (a >= 1e3) return nf(n / 1e3, 1) + ' mil';
   return nf(n, 0);
 }
-const pct = (x, d = 1) => (x === null || !isFinite(x)) ? '–' : nf(x * 100, d) + '%';
+const pct = (x, d = 1) => (x === null || x === undefined || !isFinite(x)) ? '–' : nf(x * 100, d) + '%';
 const dataCurta = d => `${d.getDate()} ${MESES[d.getMonth()]}`;
 const dataLonga = d => `${d.getDate()} ${MESES[d.getMonth()]} ${d.getFullYear()}`;
-const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-
-// ---------- leitura de CSV (aspas, quebras de linha, ; ou ,) ----------
-function lerCSV(texto) {
-  texto = texto.replace(/^﻿/, '');
-  const primeira = texto.slice(0, texto.indexOf('\n') > 0 ? texto.indexOf('\n') : texto.length);
-  const sep = (primeira.split(';').length > primeira.split(',').length) ? ';' : ',';
-  const linhas = []; let campo = '', linha = [], aspas = false;
-  for (let i = 0; i < texto.length; i++) {
-    const c = texto[i];
-    if (aspas) {
-      if (c === '"') { if (texto[i + 1] === '"') { campo += '"'; i++; } else aspas = false; }
-      else campo += c;
-    } else if (c === '"') aspas = true;
-    else if (c === sep) { linha.push(campo); campo = ''; }
-    else if (c === '\n' || c === '\r') {
-      if (c === '\r' && texto[i + 1] === '\n') i++;
-      linha.push(campo); campo = '';
-      if (linha.some(x => x !== '')) linhas.push(linha);
-      linha = [];
-    } else campo += c;
-  }
-  linha.push(campo); if (linha.some(x => x !== '')) linhas.push(linha);
-  const cab = (linhas.shift() || []).map(h => h.trim().toLowerCase());
-  return linhas.map(l => Object.fromEntries(cab.map((h, i) => [h, (l[i] ?? '').trim()])));
-}
-
+function dataDe(v) { const m = String(v || '').match(/(\d{4})-(\d{2})-(\d{2})/); return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null; }
 function numero(v) {
   if (v === undefined || v === null) return null;
-  let s = String(v).trim().toLowerCase().replace(/\s/g, '');
-  if (!s) return null;
-  const m = s.match(/^(\d+(?:[.,]\d+)*)(k|m|b|mil|mi|bi)?$/);
-  if (!m) return null;
-  if (m[2]) return Math.round(parseFloat(m[1].replace(',', '.')) * ({k: 1e3, mil: 1e3, m: 1e6, mi: 1e6, b: 1e9, bi: 1e9}[m[2]]));
-  if (/^\d{1,3}(\.\d{3})+$/.test(m[1])) return parseInt(m[1].replace(/\./g, ''), 10);
-  return Math.round(parseFloat(m[1].replace(',', '.')));
+  const s = String(v).trim().toLowerCase().replace(/\s/g, ''); if (!s) return null;
+  const m = s.match(/^(\d+(?:[.,]\d+)*)(k|m|mil|mi)?$/); if (!m) return null;
+  if (m[2]) return Math.round(parseFloat(m[1].replace(',', '.')) * ({k: 1e3, mil: 1e3, m: 1e6, mi: 1e6}[m[2]]));
+  return parseInt(m[1].replace(/[.,]/g, ''), 10);
 }
-function dataDe(v) {
-  const m = String(v || '').match(/(\d{4})-(\d{2})-(\d{2})/);
-  return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null;
-}
-const pega = (r, ...nomes) => { for (const n of nomes) if (r[n] !== undefined && r[n] !== '') return r[n]; return ''; };
-
-function normalizar(registros) {
-  return registros.map(r => ({
-    id: pega(r, 'id_video', 'id'),
-    link: pega(r, 'link', 'link_video'),
-    titulo: pega(r, 'titulo', 'titulo_legenda', 'legenda', 'titulo_grade') || 'Sem legenda',
-    data: dataDe(pega(r, 'data_publicacao', 'data')),
-    views: numero(pega(r, 'visualizacoes', 'views', 'view_count')),
-    likes: numero(pega(r, 'curtidas', 'likes')),
-    coms: numero(pega(r, 'comentarios', 'comentários', 'comments')),
-    shares: numero(pega(r, 'compartilhamentos', 'shares')),
-    conta: pega(r, 'conta', 'rotulo_perfil').replace(/^@/, ''),
-    seguidores: numero(pega(r, 'seguidores', 'followers')),
-    coleta: pega(r, 'data_coleta'),
-  }));
-}
+const mediana = a => { if (!a.length) return null; const b = [...a].sort((x, y) => x - y); const m = b.length >> 1; return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; };
+const segunda = d => { const x = new Date(d); x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); x.setHours(0, 0, 0, 0); return x; };
+const faixaDe = h => h === null || h === undefined ? null : (h < 6 ? 0 : h < 12 ? 1 : h < 18 ? 2 : 3);
 
 // ---------- exemplo (claramente marcado) ----------
 function exemplo() {
-  let s = 7; const rnd = () => (s = (s * 16807) % 2147483647) / 2147483647;
+  let s = 11; const rnd = () => (s = (s * 16807) % 2147483647) / 2147483647;
   const hoje = new Date(); hoje.setHours(0, 0, 0, 0);
   const out = []; let d = new Date(hoje);
   for (let i = 0; i < 40; i++) {
-    const views = Math.round(Math.exp(7.2 + rnd() * 2.6));
-    const likes = Math.round(views * (0.015 + rnd() * 0.05));
-    out.push({id: String(5200000000000000000 + i), link: '', titulo: `Vídeo de exemplo ${40 - i}`,
-      data: new Date(d), views, likes, coms: Math.round(likes * (0.03 + rnd() * 0.08)), shares: null,
-      conta: 'contaexemplo', seguidores: 48200, coleta: ''});
+    const dia = (d.getDay() + 6) % 7, hora = [8, 11, 13, 19, 20, 21, 22][Math.floor(rnd() * 7)];
+    const base = 900 * (dia === 4 ? 1.9 : dia === 0 ? 0.8 : 1) * (hora >= 18 ? 1.4 : 0.9) * (0.4 + rnd() * 1.4) * (rnd() > 0.93 ? 3 : 1);
+    const likes = Math.round(base);
+    out.push({id: String(5200000000000000000 + i), link: '', titulo: `Vídeo de exemplo ${40 - i}`, data: new Date(d), hora,
+      likes, coms: Math.round(likes * (0.02 + rnd() * 0.06)), conta: 'contaexemplo', seguidores: 185000, coleta: ''});
     d = new Date(d.getTime() - Math.floor(rnd() * rnd() * 5) * DIA);
   }
   return out;
 }
 
 // ---------- análise ----------
-const mediana = a => { if (!a.length) return null; const b = [...a].sort((x, y) => x - y); const m = b.length >> 1; return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; };
-const segunda = d => { const x = new Date(d); x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); x.setHours(0, 0, 0, 0); return x; };
-
-function analisar(todos, qtd, seguidoresManual) {
-  const comData = todos.filter(v => v.data).sort((a, b) => b.data - a.data);
-  const semData = todos.length - comData.length;
-  const vids = (qtd > 0 ? comData.slice(0, qtd) : comData).reverse();   // do mais antigo ao mais recente
-  if (!vids.length) return null;
-  const n = vids.length, antigo = vids[0].data, recente = vids[n - 1].data;
-  const dias = Math.round((recente - antigo) / DIA) + 1;
-  const porSemana = n / (dias / 7);
-
-  const semanas = [];
-  for (let w = segunda(antigo); w <= recente; w = new Date(w.getTime() + 7 * DIA)) semanas.push({ini: w, n: 0});
-  vids.forEach(v => { const k = Math.round((segunda(v.data) - semanas[0].ini) / (7 * DIA)); if (semanas[k]) semanas[k].n++; });
-  const semanasVazias = semanas.filter(s => s.n === 0).length;
-
-  const intervalos = [];
-  for (let i = 1; i < n; i++) intervalos.push({d: Math.round((vids[i].data - vids[i - 1].data) / DIA), de: vids[i - 1].data, ate: vids[i].data});
-  const maiorHiato = intervalos.reduce((a, b) => (b.d > (a ? a.d : -1) ? b : a), null);
-  const diasComPost = new Set(vids.map(v => iso(v.data))).size;
-
-  const porDia = [0, 0, 0, 0, 0, 0, 0];
-  vids.forEach(v => porDia[(v.data.getDay() + 6) % 7]++);
-
-  const comViews = vids.filter(v => v.views !== null);
-  const views = comViews.map(v => v.views);
-  const totalViews = views.reduce((a, b) => a + b, 0);
-  const campeao = comViews.reduce((a, b) => (!a || b.views > a.views ? b : a), null);
-
-  const eng = comViews.filter(v => v.views > 0 && v.likes !== null);
-  const V = eng.reduce((a, v) => a + v.views, 0);
-  const L = eng.reduce((a, v) => a + v.likes, 0);
-  const C = eng.reduce((a, v) => a + (v.coms || 0), 0);
-  vids.forEach(v => { v.taxa = (v.views > 0 && v.likes !== null) ? (v.likes + (v.coms || 0)) / v.views : null; });
-  const taxas = vids.map(v => v.taxa).filter(t => t !== null);
-
-  const segArquivo = Math.max(0, ...todos.map(v => v.seguidores || 0)) || null;
-  const seguidores = seguidoresManual || segArquivo;
-  const contas = [...new Set(todos.map(v => v.conta).filter(Boolean))];
-
-  return {
-    vids, n, antigo, recente, dias, porSemana, semanas, semanasVazias, intervalos, maiorHiato, diasComPost, porDia,
-    comViews: comViews.length, totalViews, mediaViews: views.length ? totalViews / views.length : null,
-    medianaViews: mediana(views), campeao, V, L, C,
-    taxa: V ? (L + C) / V : null, taxaCurtida: V ? L / V : null, taxaComent: V ? C / V : null,
-    medianaTaxa: mediana(taxas), nEng: eng.length,
-    seguidores, fonteSeg: seguidoresManual ? 'informado' : (segArquivo ? 'arquivo' : null),
-    conta: contas[0] || '', semData, totalArquivo: todos.length,
-    coleta: todos.map(v => v.coleta).find(Boolean) || '',
-  };
+function grupos(vids, chave, n) {
+  const g = Array.from({length: n}, () => ({n: 0, ints: []}));
+  vids.forEach(v => { const k = chave(v); if (k === null) return; g[k].n++; if (v.int !== null) g[k].ints.push(v.int); });
+  g.forEach(x => { x.med = mediana(x.ints); });
+  const maisPosta = g.reduce((b, x, i) => x.n > g[b].n ? i : b, 0);
+  const minimo = g.some(x => x.ints.length >= 2) ? 2 : 1;
+  let melhor = null;
+  g.forEach((x, i) => { if (x.ints.length >= minimo && (melhor === null || x.med > g[melhor].med)) melhor = i; });
+  return {g, maisPosta, melhor, minimo};
 }
 
+function analisar(todos, qtd, segManual) {
+  const comData = todos.filter(v => v.data).sort((a, b) => b.data - a.data);
+  const vids = (qtd > 0 ? comData.slice(0, qtd) : comData).reverse();
+  if (!vids.length) return null;
+  vids.forEach(v => { v.int = v.likes !== null && v.likes !== undefined ? v.likes + (v.coms || 0) : null; });
+  const n = vids.length, antigo = vids[0].data, recente = vids[n - 1].data;
+  const dias = Math.round((recente - antigo) / DIA) + 1, porSemana = n / (dias / 7);
+
+  const semanas = [];
+  for (let w = segunda(antigo); w <= recente; w = new Date(w.getTime() + 7 * DIA)) semanas.push({ini: w, n: 0, ints: []});
+  vids.forEach(v => { const k = Math.round((segunda(v.data) - semanas[0].ini) / (7 * DIA)); if (semanas[k]) { semanas[k].n++; if (v.int !== null) semanas[k].ints.push(v.int); } });
+  const intervalos = [];
+  for (let i = 1; i < n; i++) intervalos.push({d: Math.round((vids[i].data - vids[i - 1].data) / DIA), de: vids[i - 1].data, ate: vids[i].data});
+  const maiorHiato = intervalos.reduce((a, b) => (!a || b.d > a.d ? b : a), null);
+
+  const ints = vids.map(v => v.int).filter(x => x !== null);
+  const medInt = mediana(ints);
+  const L = vids.reduce((a, v) => a + (v.likes || 0), 0), C = vids.reduce((a, v) => a + (v.coms || 0), 0);
+  vids.forEach(v => { v.rel = v.int !== null && medInt ? v.int / medInt : null; });
+
+  const dias7 = grupos(vids, v => (v.data.getDay() + 6) % 7, 7);
+  const comHora = vids.filter(v => v.hora !== null && v.hora !== undefined).length;
+  const faixas = comHora >= Math.max(3, n * 0.5) ? grupos(vids, v => faixaDe(v.hora), 4) : null;
+
+  // tendência: últimos k vs k anteriores
+  let tend = null;
+  const comInt = vids.filter(v => v.int !== null);
+  if (comInt.length >= 8) {
+    const k = Math.min(10, Math.floor(comInt.length / 2));
+    const rec = mediana(comInt.slice(-k).map(v => v.int)), ant = mediana(comInt.slice(-2 * k, -k).map(v => v.int));
+    if (ant) tend = {k, rec, ant, var: rec / ant - 1};
+  }
+  // frequência x engajamento: semanas cheias vs semanas leves
+  let freqEng = null;
+  const semComPost = semanas.filter(s => s.ints.length);
+  if (semComPost.length >= 4) {
+    const corte = mediana(semComPost.map(s => s.n));
+    const cheias = semComPost.filter(s => s.n > corte).flatMap(s => s.ints), leves = semComPost.filter(s => s.n <= corte).flatMap(s => s.ints);
+    if (cheias.length >= 3 && leves.length >= 3) freqEng = {corte, cheias: mediana(cheias), leves: mediana(leves)};
+  }
+  const segArq = Math.max(0, ...todos.map(v => v.seguidores || 0)) || null;
+  const seguidores = segManual || segArq;
+  vids.forEach(v => { v.pseg = seguidores && v.int !== null ? v.int / seguidores : null; });
+  const fora = vids.filter(v => v.rel !== null && v.rel >= 2);
+  const campeao = comInt.reduce((a, b) => (!a || b.int > a.int ? b : a), null);
+
+  return {vids, n, antigo, recente, dias, porSemana, semanas, semanasVazias: semanas.filter(s => !s.n).length, intervalos, maiorHiato,
+    diasComPost: new Set(vids.map(v => v.data.toDateString())).size, medInt, L, C, dias7, faixas, comHora, tend, freqEng,
+    seguidores, fonteSeg: segManual ? 'informado' : (segArq ? 'perfil' : null), fora, campeao, nInt: ints.length,
+    conta: (todos.find(v => v.conta) || {}).conta || '', coleta: (todos.find(v => v.coleta) || {}).coleta || ''};
+}
 function ritmo(ps) {
   if (ps >= 7) return 'posta todo dia ou mais';
   if (ps >= 3) return 'posta com alta frequência';
   if (ps >= 1) return 'posta com regularidade semanal';
   return 'posta de forma esporádica';
 }
+const variacao = x => (x >= 0 ? '+' : '−') + nf(Math.abs(x) * 100, 0) + '%';
 
-// ---------- gráficos (SVG desenhado à mão) ----------
-const dica = $('#dica');
-function mostrarDica(ev, html) {
-  const alvo = ev.currentTarget.getBoundingClientRect();
-  dica.innerHTML = html; dica.hidden = false;
-  dica.style.left = (alvo.left + alvo.width / 2 + scrollX) + 'px';
-  dica.style.top = (alvo.top + scrollY) + 'px';
+function conclusaoGrupo(G, nomes, quando) {
+  if (!G || G.melhor === null) return 'Ainda não há vídeos suficientes com curtidas para comparar.';
+  const p = G.g[G.maisPosta], m = G.g[G.melhor];
+  if (G.maisPosta === G.melhor)
+    return `A conta posta mais ${nomes[G.maisPosta]} e é também quando engaja mais: <b>${compacto(m.med)} interações</b> por vídeo (mediana). Estratégia alinhada.`;
+  const ganho = p.med ? m.med / p.med - 1 : null;
+  return `Posta mais ${nomes[G.maisPosta]} (${p.n} vídeos), mas engaja mais ${nomes[G.melhor]}: <b>${compacto(m.med)} interações</b> por vídeo` +
+    (ganho !== null && isFinite(ganho) ? `, <b>${variacao(ganho)}</b> que ${nomes[G.maisPosta]}` : '') +
+    `. ${m.n <= 2 ? `Só ${m.n} vídeo(s) ${quando} ${nomes[G.melhor]}: vale testar mais antes de concluir.` : 'Vale concentrar mais posts aí.'}`;
 }
+
+// ---------- gráficos ----------
+const dica = $('#dica');
 function ligarDicas(el) {
   el.querySelectorAll('[data-dica]').forEach(m => {
-    m.addEventListener('mouseenter', e => mostrarDica(e, m.dataset.dica));
-    m.addEventListener('focus', e => mostrarDica(e, m.dataset.dica));
-    m.addEventListener('mouseleave', () => dica.hidden = true);
-    m.addEventListener('blur', () => dica.hidden = true);
+    const ver = () => { const r = m.getBoundingClientRect(); dica.innerHTML = m.dataset.dica; dica.hidden = false;
+      dica.style.left = (r.left + r.width / 2 + scrollX) + 'px'; dica.style.top = (r.top + scrollY) + 'px'; };
+    m.addEventListener('mouseenter', ver); m.addEventListener('focus', ver);
+    m.addEventListener('mouseleave', () => dica.hidden = true); m.addEventListener('blur', () => dica.hidden = true);
   });
 }
 function escalaBonita(max, passos = 4) {
   if (!max || max <= 0) return {max: 1, ticks: [0, 1]};
   const bruto = max / passos, mag = Math.pow(10, Math.floor(Math.log10(bruto)));
   const passo = [1, 2, 2.5, 5, 10].map(f => f * mag).find(p => p >= bruto);
-  const topo = Math.ceil(max / passo) * passo;
-  const ticks = []; for (let t = 0; t <= topo + 1e-9; t += passo) ticks.push(t);
+  const topo = Math.ceil(max / passo) * passo; const ticks = [];
+  for (let t = 0; t <= topo + 1e-9; t += passo) ticks.push(t);
   return {max: topo, ticks};
 }
-const larg = el => Math.max(280, Math.floor(el.clientWidth || el.parentElement.clientWidth || 600));
+const larg = el => Math.max(280, Math.floor(el.clientWidth || el.parentElement.clientWidth || 560));
+
+// duas colunas lado a lado, cada uma com sua própria escala: vídeos postados | interações medianas
+function barrasPar(el, G, rotulos) {
+  if (!G) { el.innerHTML = '<p class="vazio" style="margin:0">O Kwai não informou o horário de publicação desses vídeos.</p>'; return; }
+  const W = larg(el), l = 52, gap = 22, r = 6, lh = 28, topo = 22, H = topo + rotulos.length * lh + 4;
+  const pw = (W - l - gap - r) / 2, num = 58, bw = pw - num;
+  const maxN = Math.max(...G.g.map(x => x.n), 1), maxM = Math.max(...G.g.map(x => x.med || 0), 1);
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Vídeos postados e interações medianas">
+    <text x="${l}" y="12" font-size="11.5" fill="var(--muted)">vídeos postados</text>
+    <text x="${l + pw + gap}" y="12" font-size="11.5" fill="var(--muted)">interações medianas</text>`;
+  rotulos.forEach((rot, i) => {
+    const x = G.g[i], y = topo + i * lh;
+    const w1 = x.n ? Math.max(4, x.n / maxN * bw) : 0, w2 = x.med ? Math.max(4, x.med / maxM * bw) : 0;
+    const c1 = i === G.maisPosta ? 'var(--hot)' : 'var(--accent)', c2 = i === G.melhor ? 'var(--hot)' : 'var(--accent)';
+    const x2 = l + pw + gap;
+    s += `<text x="${l - 8}" y="${y + 15}" text-anchor="end" font-size="12" fill="var(--ink2)">${rot}</text>
+      <rect x="${l}" y="${y + 4}" width="${bw}" height="15" rx="4" fill="var(--sunken)"/>
+      <rect x="${x2}" y="${y + 4}" width="${bw}" height="15" rx="4" fill="var(--sunken)"/>`;
+    if (w1) s += `<rect x="${l}" y="${y + 4}" width="${w1}" height="15" rx="4" fill="${c1}"/>`;
+    if (w2) s += `<rect x="${x2}" y="${y + 4}" width="${w2}" height="15" rx="4" fill="${c2}" ${x.ints.length < G.minimo ? 'fill-opacity=".45"' : ''}/>`;
+    s += `<text x="${l + w1 + 6}" y="${y + 16}" font-size="12" fill="var(--ink)" font-family="var(--mono)">${x.n}</text>
+      <text x="${x2 + w2 + 6}" y="${y + 16}" font-size="12" fill="var(--ink)" font-family="var(--mono)">${x.med !== null ? compacto(x.med) : '–'}</text>
+      <rect x="0" y="${y}" width="${W}" height="${lh}" fill="transparent" tabindex="0"
+        data-dica="${esc(`${rot}: <b>${x.n}</b> vídeo(s) · mediana de <b>${x.med !== null ? nf(x.med) : '–'}</b> interações`)}"/>`;
+  });
+  el.innerHTML = s + '</svg>'; ligarDicas(el);
+}
 
 function graficoSemanas(el, A) {
-  const W = larg(el), H = 220, m = {t: 14, r: 12, b: 28, l: 30};
-  const iw = W - m.l - m.r, ih = H - m.t - m.b;
-  const esc_ = escalaBonita(Math.max(...A.semanas.map(s => s.n), Math.ceil(A.porSemana)));
-  const y = v => m.t + ih - (v / esc_.max) * ih;
-  const bw = iw / A.semanas.length, gap = Math.min(4, bw * 0.25);
+  const W = larg(el), H = 210, m = {t: 14, r: 12, b: 28, l: 30}, iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const e = escalaBonita(Math.max(...A.semanas.map(s => s.n), Math.ceil(A.porSemana)));
+  const y = v => m.t + ih - (v / e.max) * ih, bw = iw / A.semanas.length, gap = Math.min(4, bw * 0.25);
   const cada = Math.ceil(A.semanas.length / Math.max(2, Math.floor(iw / 58)));
   let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Publicações por semana">`;
-  esc_.ticks.forEach(t => { s += `<line x1="${m.l}" x2="${W - m.r}" y1="${y(t)}" y2="${y(t)}" stroke="var(--grid)" stroke-width="1"/>
-    <text x="${m.l - 8}" y="${y(t) + 4}" text-anchor="end" font-size="11" fill="var(--muted)" font-family="var(--mono)">${t}</text>`; });
+  e.ticks.forEach(t => { s += `<line x1="${m.l}" x2="${W - m.r}" y1="${y(t)}" y2="${y(t)}" stroke="var(--grid)"/><text x="${m.l - 8}" y="${y(t) + 4}" text-anchor="end" font-size="11" fill="var(--muted)" font-family="var(--mono)">${t}</text>`; });
   A.semanas.forEach((w, i) => {
-    const x = m.l + i * bw + gap / 2, h = ih - (y(w.n) - m.t);
-    const fim = new Date(w.ini.getTime() + 6 * DIA);
-    const d = `Semana de ${dataCurta(w.ini)} a ${dataCurta(fim)}<br><b>${w.n}</b> ${w.n === 1 ? 'vídeo' : 'vídeos'}`;
-    if (w.n > 0) s += `<path d="M${x},${m.t + ih} V${y(w.n) + 3} q0,-3 3,-3 h${bw - gap - 6} q3,0 3,3 V${m.t + ih} Z" fill="var(--accent)"/>`;
+    const x = m.l + i * bw + gap / 2, fim = new Date(w.ini.getTime() + 6 * DIA);
+    if (w.n) s += `<path d="M${x},${m.t + ih} V${y(w.n) + 3} q0,-3 3,-3 h${bw - gap - 6} q3,0 3,3 V${m.t + ih} Z" fill="var(--accent)"/>`;
     else s += `<rect x="${x}" y="${m.t + ih - 2}" width="${bw - gap}" height="2" fill="var(--line)"/>`;
-    s += `<rect x="${m.l + i * bw}" y="${m.t}" width="${bw}" height="${ih}" fill="transparent" tabindex="0" data-dica="${esc(d)}"/>`;
+    s += `<rect x="${m.l + i * bw}" y="${m.t}" width="${bw}" height="${ih}" fill="transparent" tabindex="0" data-dica="${esc(`Semana de ${dataCurta(w.ini)} a ${dataCurta(fim)}<br><b>${w.n}</b> vídeo(s)`)}"/>`;
     if (i % cada === 0) s += `<text x="${x + (bw - gap) / 2}" y="${H - 8}" text-anchor="middle" font-size="11" fill="var(--muted)">${dataCurta(w.ini)}</text>`;
   });
   const ym = y(A.porSemana);
@@ -1136,213 +1021,186 @@ function graficoSemanas(el, A) {
   el.innerHTML = s + '</svg>'; ligarDicas(el);
 }
 
-function graficoDias(el, A) {
-  const W = larg(el), linha = 26, H = 7 * linha + 8, l = 40, r = 36;
-  const max = Math.max(...A.porDia, 1), iw = W - l - r;
-  const topo = A.porDia.indexOf(max);
-  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Vídeos por dia da semana">`;
-  A.porDia.forEach((c, i) => {
-    const yy = 4 + i * linha, w = (c / max) * iw;
-    s += `<text x="${l - 8}" y="${yy + 15}" text-anchor="end" font-size="12" fill="var(--ink2)">${DIAS_CURTO[i]}</text>
-      <rect x="${l}" y="${yy + 4}" width="${iw}" height="14" rx="4" fill="var(--sunken)"/>`;
-    if (c) s += `<rect x="${l}" y="${yy + 4}" width="${Math.max(w, 6)}" height="14" rx="4" fill="${i === topo ? 'var(--hot)' : 'var(--accent)'}"/>`;
-    s += `<text x="${l + Math.max(w, 6) + 6}" y="${yy + 15}" font-size="12" fill="var(--ink)" font-family="var(--mono)">${c}</text>`;
-  });
-  el.innerHTML = s + '</svg>';
-}
-
-function graficoViews(el, A) {
-  const W = larg(el), H = 260, m = {t: 16, r: 14, b: 28, l: 52};
-  const iw = W - m.l - m.r, ih = H - m.t - m.b;
-  const pts = A.vids.filter(v => v.views !== null);
-  if (!pts.length) { el.innerHTML = '<p class="vazio">Este arquivo não traz visualizações.</p>'; return; }
-  const esc_ = escalaBonita(Math.max(...pts.map(v => v.views)));
+function graficoEng(el, A) {
+  const pts = A.vids.filter(v => v.int !== null);
+  if (!pts.length) { el.innerHTML = '<p class="vazio">Sem curtidas nesses vídeos.</p>'; return; }
+  const W = larg(el), H = 260, m = {t: 16, r: 14, b: 28, l: 52}, iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const e = escalaBonita(Math.max(...pts.map(v => v.int)));
   const t0 = A.antigo.getTime(), t1 = Math.max(A.recente.getTime(), t0 + DIA);
-  const x = d => m.l + ((d.getTime() - t0) / (t1 - t0)) * iw;
-  const y = v => m.t + ih - (v / esc_.max) * ih;
-  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Visualizações por vídeo ao longo do tempo">`;
-  esc_.ticks.forEach(t => { s += `<line x1="${m.l}" x2="${W - m.r}" y1="${y(t)}" y2="${y(t)}" stroke="var(--grid)"/>
-    <text x="${m.l - 8}" y="${y(t) + 4}" text-anchor="end" font-size="11" fill="var(--muted)" font-family="var(--mono)">${compacto(t)}</text>`; });
-  const nMarcas = Math.max(2, Math.floor(iw / 90));
-  for (let i = 0; i <= nMarcas; i++) { const d = new Date(t0 + (t1 - t0) * i / nMarcas);
-    s += `<text x="${x(d)}" y="${H - 8}" text-anchor="${i === 0 ? 'start' : i === nMarcas ? 'end' : 'middle'}" font-size="11" fill="var(--muted)">${dataCurta(d)}</text>`; }
-  // linha de tendência: média móvel dos últimos 5 vídeos
-  const mm = pts.map((v, i) => { const j = pts.slice(Math.max(0, i - 4), i + 1); return [x(v.data), y(j.reduce((a, b) => a + b.views, 0) / j.length)]; });
-  if (mm.length > 2) s += `<path d="${mm.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ')}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-opacity=".45" stroke-linejoin="round"/>`;
-  const ymed = y(A.medianaViews);
-  s += `<line x1="${m.l}" x2="${W - m.r}" y1="${ymed}" y2="${ymed}" stroke="var(--hot)" stroke-width="1.5" stroke-dasharray="4 4"/>
-    <text x="${m.l + 6}" y="${ymed - 6}" font-size="11.5" fill="var(--ink)" font-weight="600">mediana ${compacto(A.medianaViews)}</text>`;
+  const x = d => m.l + ((d.getTime() - t0) / (t1 - t0)) * iw, y = v => m.t + ih - (v / e.max) * ih;
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Interações por vídeo ao longo do tempo">`;
+  e.ticks.forEach(t => { s += `<line x1="${m.l}" x2="${W - m.r}" y1="${y(t)}" y2="${y(t)}" stroke="var(--grid)"/><text x="${m.l - 8}" y="${y(t) + 4}" text-anchor="end" font-size="11" fill="var(--muted)" font-family="var(--mono)">${compacto(t)}</text>`; });
+  const nM = Math.max(2, Math.floor(iw / 90));
+  for (let i = 0; i <= nM; i++) { const d = new Date(t0 + (t1 - t0) * i / nM);
+    s += `<text x="${x(d)}" y="${H - 8}" text-anchor="${i === 0 ? 'start' : i === nM ? 'end' : 'middle'}" font-size="11" fill="var(--muted)">${dataCurta(d)}</text>`; }
+  const mm = pts.map((v, i) => { const j = pts.slice(Math.max(0, i - 4), i + 1); return [x(v.data), y(mediana(j.map(q => q.int)))]; });
+  if (mm.length > 2) s += `<path d="${mm.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ')}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-opacity=".4" stroke-linejoin="round"/>`;
+  const ym = y(A.medInt);
+  s += `<line x1="${m.l}" x2="${W - m.r}" y1="${ym}" y2="${ym}" stroke="var(--hot)" stroke-width="1.5" stroke-dasharray="4 4"/>
+    <text x="${m.l + 6}" y="${ym - 6}" font-size="11.5" fill="var(--ink)" font-weight="600">mediana ${compacto(A.medInt)}</text>`;
   pts.forEach(v => {
-    const top = A.campeao && v.id === A.campeao.id;
-    const d = `${esc(v.titulo.slice(0, 80))}<br>${dataLonga(v.data)} · <b>${nf(v.views)}</b> views` + (v.taxa !== null ? ` · ${pct(v.taxa)} interação` : '');
-    s += `<circle cx="${x(v.data)}" cy="${y(v.views)}" r="${top ? 6 : 4.5}" fill="${top ? 'var(--hot)' : 'var(--accent)'}" stroke="var(--surface)" stroke-width="2"/>
-      <circle cx="${x(v.data)}" cy="${y(v.views)}" r="11" fill="transparent" tabindex="0" data-dica="${esc(d)}"/>`;
+    const alto = v.rel >= 2;
+    const d = `${esc(v.titulo.slice(0, 80))}<br>${dataLonga(v.data)} · <b>${nf(v.int)}</b> interações` + (v.rel ? ` · ${nf(v.rel, 1)}× a mediana` : '');
+    s += `<circle cx="${x(v.data)}" cy="${y(v.int)}" r="${alto ? 6 : 4.5}" fill="${alto ? 'var(--hot)' : 'var(--accent)'}" stroke="var(--surface)" stroke-width="2"/>
+      <circle cx="${x(v.data)}" cy="${y(v.int)}" r="11" fill="transparent" tabindex="0" data-dica="${esc(d)}"/>`;
   });
   el.innerHTML = s + '</svg>'; ligarDicas(el);
 }
 
 // ---------- render ----------
 let TODOS = exemplo(), EXEMPLO = true, ORDEM = {k: 'data', dir: 'desc'};
+function erro(t) { const m = $('#msg'); m.textContent = t; m.hidden = !t; }
+function normPerfil(t) {
+  t = String(t || '').trim().replace(/\$\d+$/, '');
+  const m = t.match(/@([\w.\-]+)/); if (m) return '@' + m[1].replace(/\.$/, '');
+  return /^[\w.\-]+$/.test(t) ? '@' + t : '';
+}
+function desenhar(A) {
+  barrasPar($('#g-dias'), A.dias7, DIAS_CURTO);
+  barrasPar($('#g-horas'), A.faixas, FAIXAS.map(f => f.rot));
+  graficoEng($('#g-eng'), A); graficoSemanas($('#g-semanas'), A);
+}
 
 function render(aoVivo) {
-  const qtd = +$('#qtd').value, segManual = numero($('#seg').value);
-  const A = analisar(TODOS, qtd, segManual);
-  if (!A) { if (aoVivo) return; erro('Nenhum vídeo desse arquivo tem data de publicação — sem data não dá pra medir frequência.'); return; }
+  const A = analisar(TODOS, +$('#qtd').value, numero($('#seg').value));
+  if (!A) { if (!aoVivo) erro('Nenhum vídeo tem data de publicação — sem data não dá pra analisar.'); return; }
   window.__A = A;
   const conta = A.conta || (normPerfil($('#perfil').value) || '').replace(/^@/, '') || 'conta';
   $('#lb-conta').textContent = '@' + conta;
   $('#lb-exemplo').hidden = !EXEMPLO;
   $('#lb-coleta').textContent = A.coleta ? `coletado em ${dataLonga(dataDe(A.coleta))}` : '';
+  const D = A.dias7;
 
-  const umEm = A.taxa ? Math.round(1 / A.taxa) : null;
-  $('#manchete').innerHTML = `${A.n} vídeos em ${A.dias} dias: <em>${nf(A.porSemana, 1)} por semana</em>` +
-    (umEm ? `, e 1 em cada ${nf(umEm)} views vira curtida ou comentário.` : '.');
-  const segTxt = A.seguidores ? ` Com ${compacto(A.seguidores)} seguidores, cada vídeo alcança em média o equivalente a ${pct(A.mediaViews / A.seguidores, A.mediaViews / A.seguidores < 0.1 ? 1 : 0)} da base.` : '';
-  $('#resumo').textContent = `Do mais antigo (${dataLonga(A.antigo)}) ao mais recente (${dataLonga(A.recente)}), a conta ${ritmo(A.porSemana)}. ` +
-    (A.mediaViews !== null ? `Cada vídeo teve em média ${compacto(A.mediaViews)} views (mediana ${compacto(A.medianaViews)}).` : '') + segTxt;
+  let man = `${A.n} vídeos em ${A.dias} dias: <em>${nf(A.porSemana, 1)} por semana</em>.`;
+  if (D.melhor !== null && D.melhor !== D.maisPosta) man += ` Posta mais ${DIAS_NOS[D.maisPosta]}, mas engaja mais ${DIAS_NOS[D.melhor]}.`;
+  else if (D.melhor !== null) man += ` Posta e engaja mais ${DIAS_NOS[D.melhor]}.`;
+  $('#manchete').innerHTML = man;
+  $('#resumo').textContent = `Do vídeo mais antigo (${dataLonga(A.antigo)}) ao mais recente (${dataLonga(A.recente)}), a conta ${ritmo(A.porSemana)}. ` +
+    (A.medInt !== null ? `Um vídeo típico recebe ${compacto(A.medInt)} interações (curtidas + comentários).` : '') +
+    (A.seguidores && A.medInt !== null ? ` Com ${compacto(A.seguidores)} seguidores, isso é ${pct(A.medInt / A.seguidores, 2)} da base por vídeo.` : '');
 
-  const topoDia = A.porDia.indexOf(Math.max(...A.porDia));
   $('#chips').innerHTML = [
     `Ritmo: <b>${ritmo(A.porSemana).replace('posta ', '')}</b>`,
-    `Dia preferido: <b>${DIAS_LONGO[topoDia]}</b>`,
-    `Semanas sem post: <b>${A.semanasVazias} de ${A.semanas.length}</b>`,
-    A.campeao ? `Maior alcance: <b>${compacto(A.campeao.views)}</b> em ${dataCurta(A.campeao.data)}` : '',
+    A.maiorHiato ? `Maior pausa: <b>${A.maiorHiato.d} dias</b>` : '',
+    A.tend ? `Tendência: <b>${variacao(A.tend.var)}</b> nos últimos ${A.tend.k} vídeos` : '',
+    `Fora da curva: <b>${A.fora.length} vídeo(s)</b> com 2× a mediana`,
   ].filter(Boolean).map(c => `<span class="chip">${c}</span>`).join('');
 
+  const por1000 = A.seguidores && A.medInt !== null ? A.medInt / A.seguidores * 1000 : null;
   $('#kpis').innerHTML = [
     ['Período analisado', `${dataCurta(A.antigo)} → ${dataCurta(A.recente)}`, `${A.dias} dias · ${A.n} vídeos`],
-    ['Publicações por semana', nf(A.porSemana, 1), `${nf(A.porSemana / 7 * 30, 0)} por mês, em média`],
-    ['Views por vídeo', A.mediaViews !== null ? compacto(A.mediaViews) : '–', A.comViews ? `${compacto(A.totalViews)} no total` : 'sem views no arquivo'],
-    ['Interação por view', pct(A.taxa, 2), A.taxa ? `curtidas + comentários ÷ views` : 'sem curtidas no arquivo'],
+    ['Publicações por semana', nf(A.porSemana, 1), `${nf(A.porSemana / 7 * 30, 0)} por mês`],
+    ['Interações por vídeo', compacto(A.medInt), 'mediana de curtidas + comentários'],
+    ['A cada 1.000 seguidores', por1000 !== null ? nf(por1000, por1000 < 10 ? 1 : 0) : '–', por1000 !== null ? 'interagem com um vídeo típico' : 'precisa dos seguidores'],
     ['Seguidores', A.seguidores ? compacto(A.seguidores) : '–', A.seguidores ? (A.fonteSeg === 'informado' ? 'informado por você' : 'lido do perfil') : 'informe no campo acima'],
   ].map(([r, v, s]) => `<div class="kpi"><span>${r}</span><b>${v}</b><small>${s}</small></div>`).join('');
 
-  $('#sub-semanas').textContent = `${A.semanas.length} semanas, de ${dataCurta(A.semanas[0].ini)} em diante · linha tracejada = média do período`;
-  const hiato = A.maiorHiato;
-  $('#stats-freq').innerHTML = [
-    ['Intervalo típico entre posts', A.intervalos.length ? `${nf(mediana(A.intervalos.map(i => i.d)), 1)} dia(s)` : '–', 'mediana'],
-    ['Maior pausa', hiato ? `${hiato.d} dia(s)` : '–', hiato ? `${dataCurta(hiato.de)} → ${dataCurta(hiato.ate)}` : ''],
-    ['Dias com post', `${A.diasComPost} de ${A.dias}`, `${nf(A.n / A.diasComPost, 1)} vídeo(s) por dia postado`],
-  ].map(([t, v, s]) => `<div><dt>${t}</dt><dd>${v}<small>${s}</small></dd></div>`).join('');
+  // insights
+  const ins = [];
+  if (D.melhor !== null && D.melhor !== D.maisPosta) {
+    const g = D.g[D.melhor].med / (D.g[D.maisPosta].med || 1) - 1;
+    ins.push(`<b>Dia:</b> a conta concentra posts ${DIAS_NOS[D.maisPosta]}, mas os vídeos ${DIAS_NOS[D.melhor]} engajam ${variacao(g)}. Mudar o calendário é um ganho rápido.`);
+  }
+  if (A.faixas && A.faixas.melhor !== null && A.faixas.melhor !== A.faixas.maisPosta) {
+    const F = A.faixas, g = F.g[F.melhor].med / (F.g[F.maisPosta].med || 1) - 1;
+    ins.push(`<b>Horário:</b> a maioria dos vídeos sai ${FAIXAS[F.maisPosta].nome}, mas quem posta ${FAIXAS[F.melhor].nome} engaja ${variacao(g)}.`);
+  }
+  if (A.tend) ins.push(`<b>Tendência:</b> os últimos ${A.tend.k} vídeos têm mediana de ${compacto(A.tend.rec)} interações, contra ${compacto(A.tend.ant)} dos ${A.tend.k} anteriores (${variacao(A.tend.var)}). ${A.tend.var < -0.15 ? 'O engajamento está caindo.' : A.tend.var > 0.15 ? 'O engajamento está subindo.' : 'Estável.'}`);
+  if (A.freqEng) ins.push(`<b>Volume x engajamento:</b> nas semanas com mais de ${nf(A.freqEng.corte)} posts, cada vídeo teve ${compacto(A.freqEng.cheias)} interações (mediana), contra ${compacto(A.freqEng.leves)} nas semanas mais leves. ${A.freqEng.cheias < A.freqEng.leves * 0.85 ? 'Postar mais está diluindo o engajamento.' : A.freqEng.cheias > A.freqEng.leves * 1.15 ? 'Postar mais está puxando o engajamento pra cima.' : 'Postar mais não mudou o engajamento por vídeo.'}`);
+  if (A.maiorHiato && A.maiorHiato.d >= 5) ins.push(`<b>Pausa:</b> ficou ${A.maiorHiato.d} dias sem postar (${dataCurta(A.maiorHiato.de)} → ${dataCurta(A.maiorHiato.ate)}).`);
+  if (A.L) { const c100 = A.C / A.L * 100; ins.push(`<b>Conversa:</b> ${nf(c100, 1)} comentários a cada 100 curtidas. ${c100 < 3 ? 'O público curte, mas pouco conversa: perguntas diretas e chamadas pra comentar ajudam.' : c100 > 8 ? 'Público que conversa bastante: bom sinal de comunidade.' : 'Nível de conversa moderado.'}`); }
+  if (A.campeao && A.campeao.rel) ins.push(`<b>O que funciona:</b> o melhor vídeo (${dataCurta(A.campeao.data)}) teve ${nf(A.campeao.rel, 1)}× a mediana. ${A.fora.length > 1 ? `Outros ${A.fora.length - 1} também passaram de 2×: vale ver o que eles têm em comum.` : 'Vale entender o que ele fez de diferente.'}`);
+  $('#insights').innerHTML = ins.map(t => `<li><span>${t}</span></li>`).join('') || '<li><span>Dados insuficientes pra conclusões.</span></li>';
 
-  $('#sub-views').textContent = `Cada ponto é um vídeo · ponto maior e mais escuro = maior alcance · linha clara = média dos últimos 5 vídeos`;
+  $('#c-dias').innerHTML = conclusaoGrupo(D, DIAS_NOS, 'publicado(s)');
+  $('#c-horas').innerHTML = A.faixas ? conclusaoGrupo(A.faixas, FAIXAS.map(f => f.nome), 'publicado(s)') : `Só ${A.comHora} de ${A.n} vídeos trouxeram o horário — pouco pra comparar.`;
+  $('#c-horas').hidden = !A.faixas && A.comHora === 0;
 
-  // taxa
-  const por100 = A.taxa !== null ? A.taxa * 100 : null;
-  $('#taxa-num').innerHTML = por100 !== null ? `${nf(por100, por100 < 10 ? 1 : 0)}<small>de cada 100 views<br>viram interação</small>` : '–<small>sem curtidas no arquivo</small>';
-  const curt = A.taxaCurtida !== null ? Math.round(A.taxaCurtida * 100) : 0;
-  const com = A.taxaComent !== null ? Math.max(A.taxaComent > 0 ? 1 : 0, Math.round(A.taxaComent * 100)) : 0;
-  $('#pessoas').innerHTML = Array.from({length: 100}, (_, i) => `<i class="${i < com ? 'com' : i < com + curt ? 'on' : ''}"></i>`).join('');
+  $('#sub-eng').textContent = 'Cada ponto é um vídeo (curtidas + comentários) · ponto maior = 2× a mediana ou mais · linha clara = mediana dos últimos 5 vídeos';
   $('#stats-eng').innerHTML = [
-    ['Chance de curtir', pct(A.taxaCurtida, 2), A.taxaCurtida ? `1 a cada ${nf(1 / A.taxaCurtida)} views` : ''],
-    ['Chance de comentar', pct(A.taxaComent, 2), A.taxaComent ? `1 a cada ${nf(1 / A.taxaComent)} views` : ''],
-    ['Vídeo típico', pct(A.medianaTaxa, 2), 'mediana da taxa por vídeo'],
-    ['Curtidas por seguidor', A.seguidores && A.n ? nf(A.L / A.n / A.seguidores * 100, 2) + '%' : '–', A.seguidores ? 'média por vídeo ÷ seguidores' : 'precisa dos seguidores'],
+    ['Vídeo típico', compacto(A.medInt), 'mediana de interações'],
+    ['Tendência', A.tend ? variacao(A.tend.var) : '–', A.tend ? `últimos ${A.tend.k} vs ${A.tend.k} anteriores` : 'precisa de 8+ vídeos'],
+    ['Fora da curva', `${A.fora.length} vídeo(s)`, '2× a mediana ou mais'],
+    ['Comentários por 100 curtidas', A.L ? nf(A.C / A.L * 100, 1) : '–', 'nível de conversa'],
   ].map(([t, v, s]) => `<div><dt>${t}</dt><dd>${v}<small>${s}</small></dd></div>`).join('');
 
-  const top = A.vids.filter(v => v.taxa !== null && v.views >= 100).sort((a, b) => b.taxa - a.taxa).slice(0, 5);
-  $('#top-eng').innerHTML = top.length ? top.map(v => `<li><div style="min-width:0">${v.link ? `<a href="${esc(v.link)}" target="_blank" rel="noopener">${esc(v.titulo)}</a>` : `<span>${esc(v.titulo)}</span>`}<small>${dataLonga(v.data)} · ${compacto(v.views)} views</small></div><b class="mono">${pct(v.taxa)}</b></li>`).join('')
-    : '<li class="vazio">Sem vídeos com views e curtidas suficientes.</li>';
+  $('#sub-semanas').textContent = `${A.semanas.length} semanas · linha tracejada = média do período`;
+  $('#stats-freq').innerHTML = [
+    ['Intervalo típico', A.intervalos.length ? `${nf(mediana(A.intervalos.map(i => i.d)), 1)} dia(s)` : '–', 'entre um post e outro'],
+    ['Maior pausa', A.maiorHiato ? `${A.maiorHiato.d} dia(s)` : '–', A.maiorHiato ? `${dataCurta(A.maiorHiato.de)} → ${dataCurta(A.maiorHiato.ate)}` : ''],
+    ['Semanas sem post', `${A.semanasVazias} de ${A.semanas.length}`, ''],
+  ].map(([t, v, s]) => `<div><dt>${t}</dt><dd>${v}<small>${s}</small></dd></div>`).join('');
 
-  tabela(A);
-  graficoSemanas($('#g-semanas'), A); graficoDias($('#g-dias'), A); graficoViews($('#g-views'), A);
+  $('#seg-num').innerHTML = por1000 !== null ? `${nf(por1000, por1000 < 10 ? 1 : 0)}<small>de cada 1.000 seguidores interagem com um vídeo típico</small>`
+    : `–<small>informe os seguidores no campo acima</small>`;
+  const melhorSeg = A.seguidores && A.campeao ? A.campeao.int / A.seguidores : null;
+  $('#stats-seg').innerHTML = [
+    ['Taxa de engajamento', A.seguidores ? pct(A.medInt / A.seguidores, 2) : '–', 'vídeo típico ÷ seguidores'],
+    ['Melhor vídeo', melhorSeg !== null ? pct(melhorSeg, 2) : '–', 'da base interagiu'],
+    ['Curtidas por vídeo', A.n ? compacto(A.L / A.n) : '–', 'média'],
+    ['Comentários por vídeo', A.n ? compacto(A.C / A.n) : '–', 'média'],
+  ].map(([t, v, s]) => `<div><dt>${t}</dt><dd>${v}<small>${s}</small></dd></div>`).join('');
 
+  const top = A.vids.filter(v => v.int !== null).sort((a, b) => b.int - a.int).slice(0, 5);
+  $('#top-eng').innerHTML = top.map(v => `<li><div style="min-width:0">${v.link ? `<a href="${esc(v.link)}" target="_blank" rel="noopener">${esc(v.titulo)}</a>` : `<span>${esc(v.titulo)}</span>`}
+    <small>${dataLonga(v.data)}${v.hora !== null && v.hora !== undefined ? ` · ${v.hora}h` : ''} · ${DIAS_CURTO[(v.data.getDay() + 6) % 7]} · ${nf(v.int)} interações</small></div>
+    <b class="vezes">${v.rel ? nf(v.rel, 1) + '×' : ''}</b></li>`).join('') || '<li class="vazio">Sem vídeos com curtidas.</li>';
+
+  tabela(A); desenhar(A);
   const notas = [];
   if (EXEMPLO) notas.push('Números de exemplo: cole o link de um perfil e clique em Analisar.');
-  if (A.semData) notas.push(`${A.semData} vídeo(s) do arquivo ficaram de fora por não terem data de publicação.`);
-  if (A.comViews < A.n) notas.push(`${A.n - A.comViews} vídeo(s) sem visualizações — entram na frequência, mas não nas médias de views.`);
-  if (A.dias < 14) notas.push('Período curto (menos de 2 semanas): a média semanal oscila muito.');
-  notas.push('Interação por view = (curtidas + comentários) ÷ views somados dos vídeos que têm os três números.');
+  notas.push('Interações = curtidas + comentários. Usamos a mediana (o vídeo do meio) para um viral não distorcer o resultado.');
   $('#nota-final').textContent = notas.join(' ');
 }
 
 function tabela(A) {
   const {k, dir} = ORDEM, f = dir === 'asc' ? 1 : -1;
-  const rows = [...A.vids].sort((a, b) => {
-    const x = a[k], y = b[k];
+  const rows = [...A.vids].sort((a, b) => { const x = a[k], y = b[k];
     if (x === null || x === undefined) return 1; if (y === null || y === undefined) return -1;
-    return (typeof x === 'string' ? x.localeCompare(y) : x - y) * f;
-  });
+    return (typeof x === 'string' ? x.localeCompare(y) : x - y) * f; });
+  const cel = v => v !== null && v !== undefined ? nf(v) : '<span class="vazio">–</span>';
   $('#linhas').innerHTML = rows.map(v => `<tr>
-    <td class="mono" style="white-space:nowrap">${dataLonga(v.data)}</td>
+    <td class="mono" style="white-space:nowrap">${dataLonga(v.data)}<br><span class="hora">${DIAS_CURTO[(v.data.getDay() + 6) % 7]}${v.hora !== null && v.hora !== undefined ? ` · ${v.hora}h` : ''}</span></td>
     <td class="t"><span class="t-tit" title="${esc(v.titulo)}">${esc(v.titulo)}</span>${v.link
       ? `<a class="t-link" href="${esc(v.link)}" target="_blank" rel="noopener">${esc(v.link.replace(/^https?:\/\/(www\.)?/, ''))} ↗</a>`
       : `<span class="t-link vazio">sem link (vídeo de exemplo)</span>`}</td>
-    <td class="n">${v.views !== null ? nf(v.views) : '<span class="vazio">–</span>'}${v.viewsTxt ? `<span class="lido">lido: ▷ ${esc(v.viewsTxt)}</span>` : ''}</td>
-    <td class="n">${v.likes !== null ? nf(v.likes) : '<span class="vazio">–</span>'}</td>
-    <td class="n">${v.coms !== null ? nf(v.coms) : '<span class="vazio">–</span>'}</td>
-    <td class="n">${pct(v.taxa, 2)}</td></tr>`).join('');
+    <td class="n">${cel(v.likes)}</td><td class="n">${cel(v.coms)}</td><td class="n">${cel(v.int)}</td>
+    <td class="n">${v.rel ? nf(v.rel, 1) + '×' : '–'}</td><td class="n">${v.pseg !== null ? pct(v.pseg, 2) : '–'}</td></tr>`).join('');
   document.querySelectorAll('th[data-k]').forEach(th => th.setAttribute('aria-sort', th.dataset.k === k ? (dir === 'asc' ? 'ascending' : 'descending') : 'none'));
 }
 document.querySelectorAll('th[data-k]').forEach(th => {
   const ir = () => { const k = th.dataset.k; ORDEM = ORDEM.k === k ? {k, dir: ORDEM.dir === 'asc' ? 'desc' : 'asc'} : {k, dir: k === 'titulo' ? 'asc' : 'desc'}; tabela(window.__A); };
   th.addEventListener('click', ir); th.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); ir(); } });
 });
-
-// ---------- entrada ----------
-function normPerfil(t) {
-  t = String(t || '').trim().replace(/\$\d+$/, '');
-  const m = t.match(/@([\w.\-]+)/); if (m) return '@' + m[1].replace(/\.$/, '');
-  return /^[\w.\-]+$/.test(t) ? '@' + t : '';
-}
-function atualizarCodigo() {}
-function erro(t) { const m = $('#msg'); m.textContent = t; m.hidden = !t; }
-
 $('#perfil').addEventListener('input', () => { if (EXEMPLO) render(); });
-$('#qtd').addEventListener('change', () => { atualizarCodigo(); render(); });
-$('#seg').addEventListener('input', render);
-function carregarArquivo(f) {
-  if (!f) return;
-  const r = new FileReader();
-  r.onload = () => {
-    try {
-      const vids = normalizar(lerCSV(String(r.result)));
-      if (!vids.length) return erro('O arquivo está vazio ou não é um CSV.');
-      if (!vids.some(v => v.data)) return erro('Não achei a coluna data_publicacao com datas nesse CSV. Use o CSV do coletar_csv ou da pasta Basedadosconteudo.');
-      if (!vids.some(v => v.views !== null || v.likes !== null)) erro('Aviso: esse CSV não tem visualizações nem curtidas — só a frequência vai aparecer.');
-      else erro('');
-      TODOS = vids; EXEMPLO = false;
-      if (vids[0].conta && !normPerfil($('#perfil').value)) $('#perfil').value = 'https://www.kwai.com/@' + vids[0].conta;
-      $('#zona-txt').textContent = `${f.name} · ${vids.length} vídeo(s)`;
-      atualizarCodigo(); render();
-    } catch (e) { erro('Não consegui ler esse arquivo: ' + e.message); }
-  };
-  r.readAsText(f, 'utf-8');
-}
-$('#arquivo').addEventListener('change', e => carregarArquivo(e.target.files[0]));
-const zona = $('#zona');
-['dragenter', 'dragover'].forEach(t => zona.addEventListener(t, e => { e.preventDefault(); zona.classList.add('arrastando'); }));
-['dragleave', 'drop'].forEach(t => zona.addEventListener(t, e => { e.preventDefault(); zona.classList.remove('arrastando'); }));
-zona.addEventListener('drop', e => carregarArquivo(e.dataTransfer.files[0]));
-
-let tempo; new ResizeObserver(() => { clearTimeout(tempo); tempo = setTimeout(() => window.__A && (graficoSemanas($('#g-semanas'), window.__A), graficoDias($('#g-dias'), window.__A), graficoViews($('#g-views'), window.__A)), 120); }).observe($('.wrap'));
+$('#qtd').addEventListener('change', () => render());
+$('#seg').addEventListener('input', () => render());
+let tempo; new ResizeObserver(() => { clearTimeout(tempo); tempo = setTimeout(() => window.__A && desenhar(window.__A), 120); }).observe($('.wrap'));
 
 // ---------- coleta: o servidor puxa os dados do perfil ----------
 let ROBO = false, rodando = false;
-fetch('api/ping').then(r => r.ok ? r.json() : null).then(j => { ROBO = !!(j && j.ok); }).catch(() => {});
-
+if (window.fetch) fetch('api/ping').then(r => r.ok ? r.json() : null).then(j => { ROBO = !!(j && j.ok); }).catch(() => {});
 function status(t, girando) { $('#status').innerHTML = (girando ? '<span class="spin"></span>' : '') + esc(t); }
 function deJob(job) {
   const seg = job.perfil_info && job.perfil_info.seguidores;
   return (job.itens || []).map(it => ({
     id: it.id_video, link: it.link, titulo: it.titulo || it.legenda || 'Sem legenda',
-    data: dataDe(it.data_publicacao), views: it.visualizacoes ?? null, likes: it.curtidas ?? null,
-    coms: it.comentarios ?? null, shares: it.compartilhamentos ?? null, viewsTxt: it.views_grade_texto || '',
+    data: dataDe(it.data_publicacao), hora: it.hora_publicacao ?? null, likes: it.curtidas ?? null, coms: it.comentarios ?? null,
     conta: job.conta, seguidores: seg ?? null, coleta: (job.inicio || '').slice(0, 10),
   }));
 }
 async function analisarPerfil() {
   if (rodando) return;
   const perfil = normPerfil($('#perfil').value);
-  if (!perfil) { erro('Cole o link do perfil, por exemplo https://www.kwai.com/@augustocuryoficial'); return; }
+  if (!perfil) { erro('Cole o link do perfil, por exemplo https://www.kwai.com/@Lulaoficial'); return; }
   if (!ROBO) { $('#sem-robo').hidden = false; erro(''); return; }
   erro(''); rodando = true; $('#analisar').disabled = true; $('#barra').hidden = false; $('#progresso').style.width = '4%';
   status('Iniciando…', true);
   try {
     const r = await fetch('api/coletar', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({perfil: 'https://www.kwai.com/' + perfil, max: (+$('#qtd').value) || 150})});
+      body: JSON.stringify({perfil: 'https://www.kwai.com/' + perfil, max: +$('#qtd').value || 40})});
     const j = await r.json();
-    if (!r.ok) throw new Error(j.erro || 'o robô recusou o pedido');
+    if (!r.ok) throw new Error(j.erro || 'o servidor recusou o pedido');
     for (;;) {
       await new Promise(ok => setTimeout(ok, 1200));
       const job = await (await fetch('api/job/' + j.job)).json();
@@ -1365,7 +1223,6 @@ async function analisarPerfil() {
 }
 $('#analisar').addEventListener('click', analisarPerfil);
 $('#perfil').addEventListener('keydown', e => { if (e.key === 'Enter') analisarPerfil(); });
-
 render();
 })();
 </script>
