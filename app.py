@@ -223,7 +223,7 @@ def casar_views(itens, cards_views):
                         break
         n = contagem_para_int(v) if v is not None else None
         if n is not None:
-            it["visualizacoes"], it["fonte_views"] = n, "grade"
+            it["visualizacoes"], it["fonte_views"], it["views_grade_texto"] = n, "grade", v
 
 
 def montar_driver(desktop=False):
@@ -349,7 +349,6 @@ def ler_grade_do_perfil(url_perfil, conta, max_videos, avisar):
             html = driver.page_source
             ids_html = re.findall(r"/video/(\d{8,})", html)
             ids_html += re.findall(r'"photoId"\s*:\s*"?(\d{8,})"?', html)
-            _ler_cards_views(driver, cards_views, chaves)
 
             antes = len(ids)
             for vid in ids_dom + ids_html:
@@ -358,8 +357,6 @@ def ler_grade_do_perfil(url_perfil, conta, max_videos, avisar):
                     ids.append(vid)
             avisar(f"Rolando a grade: {len(ids)}/{max_videos} vídeo(s)")
             if len(ids) >= max_videos:
-                _rolar(driver)
-                _ler_cards_views(driver, cards_views, chaves)
                 break
             sem_novidade = sem_novidade + 1 if len(ids) == antes else 0
             if sem_novidade >= 8:
@@ -377,8 +374,8 @@ def ler_grade_do_perfil(url_perfil, conta, max_videos, avisar):
     finally:
         driver.quit()
 
-    if ids and len(cards_views) < len(ids[:max_videos]) * 0.6:
-        avisar("Lendo as visualizações na grade do perfil…")
+    if ids:
+        avisar("Lendo as visualizações (▷) na grade do perfil…")
         try:
             d2 = montar_driver(desktop=True)
             try:
@@ -809,6 +806,7 @@ HTML = r"""<!doctype html>
   td.t a.t-link:hover { text-decoration: underline; }
   td.t .t-link.vazio { color: var(--muted); }
   .vazio { color: var(--muted); }
+  .lido { display: block; font: 11px/1.3 var(--mono); color: var(--muted); }
 
   #dica { position: absolute; pointer-events: none; background: var(--ink); color: var(--bg); font-size: 12.5px; line-height: 1.4;
           padding: 7px 9px; border-radius: 8px; max-width: 260px; z-index: 5; transform: translate(-50%, calc(-100% - 10px)); }
@@ -1270,7 +1268,7 @@ function tabela(A) {
     <td class="t"><span class="t-tit" title="${esc(v.titulo)}">${esc(v.titulo)}</span>${v.link
       ? `<a class="t-link" href="${esc(v.link)}" target="_blank" rel="noopener">${esc(v.link.replace(/^https?:\/\/(www\.)?/, ''))} ↗</a>`
       : `<span class="t-link vazio">sem link (vídeo de exemplo)</span>`}</td>
-    <td class="n">${v.views !== null ? nf(v.views) : '<span class="vazio">–</span>'}</td>
+    <td class="n">${v.views !== null ? nf(v.views) : '<span class="vazio">–</span>'}${v.viewsTxt ? `<span class="lido">lido: ▷ ${esc(v.viewsTxt)}</span>` : ''}</td>
     <td class="n">${v.likes !== null ? nf(v.likes) : '<span class="vazio">–</span>'}</td>
     <td class="n">${v.coms !== null ? nf(v.coms) : '<span class="vazio">–</span>'}</td>
     <td class="n">${pct(v.taxa, 2)}</td></tr>`).join('');
@@ -1329,7 +1327,7 @@ function deJob(job) {
   return (job.itens || []).map(it => ({
     id: it.id_video, link: it.link, titulo: it.titulo || it.legenda || 'Sem legenda',
     data: dataDe(it.data_publicacao), views: it.visualizacoes ?? null, likes: it.curtidas ?? null,
-    coms: it.comentarios ?? null, shares: it.compartilhamentos ?? null,
+    coms: it.comentarios ?? null, shares: it.compartilhamentos ?? null, viewsTxt: it.views_grade_texto || '',
     conta: job.conta, seguidores: seg ?? null, coleta: (job.inicio || '').slice(0, 10),
   }));
 }
