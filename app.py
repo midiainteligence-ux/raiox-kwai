@@ -5,9 +5,11 @@ RAIO-X KWAI — site público
 Qualquer pessoa abre o site, cola o link de um perfil do Kwai e clica em
 Analisar. O servidor puxa os links dos últimos vídeos (mesma coleta do robô
 de links, em modo celular), lê views/curtidas/comentários/data de cada um e
-a página monta o laudo na hora. Depois, em segundo plano, baixa o áudio
-de cada vídeo e TRANSCREVE localmente com o Whisper (mesma lógica do
-notebook do Colab) — a transcrição vai aparecendo na tabela e no CSV.
+a página monta o laudo na hora: frequência, dia da semana, horário,
+duração dos vídeos, período do mês e mês a mês.
+
+Duração: lida do próprio arquivo de vídeo com o ffprobe (vem com o ffmpeg,
+só lê o cabeçalho, não baixa o vídeo inteiro); sem ffprobe, tenta achar no HTML.
 
 Proteções pra uso público:
   - FILA: no máximo COLETAS_SIMULTANEAS navegadores ao mesmo tempo; quem
@@ -15,13 +17,6 @@ Proteções pra uso público:
   - CACHE: o mesmo perfil analisado há menos de CACHE_HORAS devolve o
     resultado pronto, sem abrir o navegador de novo.
   - LIMITE POR PESSOA: no máximo MAX_POR_IP análises em andamento por IP.
-
-Transcrição: precisa de `openai-whisper` (pip) e do `ffmpeg` (sistema).
-  TRANSCREVER=0 desliga · MODELO_WHISPER=tiny/base/small (padrão: base).
-  MAX_TRANSCRICOES=10: só os 10 vídeos mais recentes são transcritos; o
-  resto do perfil fica só com as métricas.
-  Os textos ficam em PASTA_TRANSCRICOES (cache: vídeo já transcrito não
-  é transcrito de novo).
 
 Rodar local:  pip install -r requirements.txt && python app.py
 Publicar:     veja o README.md (Hugging Face Spaces, grátis).
@@ -46,12 +41,7 @@ CACHE_HORAS = float(os.environ.get("CACHE_HORAS", "6"))
 MAX_POR_IP = int(os.environ.get("MAX_POR_IP", "2"))
 MAX_VIDEOS_TETO = 80
 TRABALHADORES_PAGINA = 4
-TRANSCREVER = os.environ.get("TRANSCREVER", "1") != "0"
-MODELO_WHISPER = os.environ.get("MODELO_WHISPER", "base")      # tiny / base / small / medium
-PASTA_TRANSCRICOES = os.environ.get("PASTA_TRANSCRICOES", "transcricoes")
-PASTA_TMP = os.environ.get("PASTA_TMP", "/tmp/kwai_audio")
-MAX_MB_VIDEO = 300
-MAX_TRANSCRICOES = int(os.environ.get("MAX_TRANSCRICOES", "10"))   # só os N vídeos mais recentes são transcritos
+TEM_FFPROBE = shutil.which("ffprobe") is not None
 FUSO_BR = timezone(timedelta(hours=-3))
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -376,6 +366,53 @@ def _data_publicacao(html, video_id):
     return "", None, ""
 
 
+def _duracao_iso(html):
+    """JSON-LD da própria página: "duration":"PT1M5S"."""
+    m = re.search(r'"duration"\s*:\s*"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?"', html)
+    if not m or not any(m.groups()):
+        return None
+    h, mi, se = (float(x) if x else 0 for x in m.groups())
+    total = round(h * 3600 + mi * 60 + se)
+    return total if total > 0 else None
+
+
+def _duracao_ffprobe(url):
+    """Lê a duração direto do arquivo de vídeo (só o cabeçalho, é rápido)."""
+    if not (TEM_FFPROBE and url):
+        return None
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-user_agent", HEADERS["User-Agent"],
+                            "-headers", f"Referer: {HEADERS['Referer']}\r\n",
+                            "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", url],
+                           capture_output=True, text=True, timeout=25)
+        v = float(r.stdout.strip().split("\n")[0])
+        return round(v) if v > 0 else None
+    except Exception:
+        return None
+
+
+def _duracao_perto_do_id(html, video_id):
+    """Último recurso: campo de duração mais perto do ID do vídeo no HTML."""
+    padrao = re.compile(r'\b(?:duration|videoDuration|video_duration|photoDuration)"?\s*:\s*"?(\d+(?:\.\d+)?)')
+    melhor = None
+    for m_id in re.finditer(re.escape(video_id), html):
+        ini = max(0, m_id.start() - 1500)
+        janela = html[ini:m_id.end() + 1500]
+        pos = m_id.start() - ini
+        for m in padrao.finditer(janela):
+            d = abs(m.start() - pos)
+            if melhor is None or d < melhor[0]:
+                melhor = (d, float(m.group(1)))
+    if melhor is None:
+        return None
+    v = melhor[1] / 1000 if melhor[1] > 3600 else melhor[1]      # > 1h só faz sentido em milissegundos
+    return round(v) if 1 <= v <= 3600 else None
+
+
+def duracao_do_video(html, video_id):
+    return _duracao_iso(html) or _duracao_ffprobe(_url_video(html)) or _duracao_perto_do_id(html, video_id)
+
+
 def metricas_da_pagina(link, video_id):
     r = requests.get(link, headers=HEADERS, timeout=25)
     html = r.text
@@ -412,79 +449,8 @@ def metricas_da_pagina(link, video_id):
                 break
 
     out["data_publicacao"], out["hora_publicacao"], out["fonte_data"] = _data_publicacao(html, video_id)
-    out["url_video"] = _url_video(html)
+    out["duracao"] = duracao_do_video(html, video_id)
     return out
-
-
-# ----------------------------------------------------------------------
-# 3) TRANSCRIÇÃO LOCAL (Whisper) — mesma lógica do notebook do Colab:
-#    baixa o .mp4 → ffmpeg extrai o áudio → Whisper transcreve
-# ----------------------------------------------------------------------
-
-_MODELO_WHISPER = None
-TRAVA_WHISPER = threading.Lock()      # um áudio por vez (Whisper pesa e não é thread-safe)
-
-
-def transcricao_disponivel():
-    if not TRANSCREVER or shutil.which("ffmpeg") is None:
-        return False
-    try:
-        import whisper  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def _modelo():
-    global _MODELO_WHISPER
-    if _MODELO_WHISPER is None:
-        import whisper
-        _MODELO_WHISPER = whisper.load_model(MODELO_WHISPER)
-    return _MODELO_WHISPER
-
-
-def _cache_transcricao(video_id):
-    return os.path.join(PASTA_TRANSCRICOES, f"kwai_{video_id}.txt")
-
-
-def transcrever_video(video_id, url_video):
-    """Devolve o texto falado no vídeo. Usa o cache em disco se já existir."""
-    cache = _cache_transcricao(video_id)
-    if os.path.exists(cache):
-        with open(cache, encoding="utf-8") as f:
-            return f.read().strip()
-    if not url_video:
-        raise RuntimeError("a página não trouxe o arquivo de vídeo")
-
-    os.makedirs(PASTA_TMP, exist_ok=True)
-    mp4 = os.path.join(PASTA_TMP, f"{video_id}_{uuid.uuid4().hex[:6]}.mp4")
-    wav = mp4[:-4] + ".wav"
-    try:
-        with requests.get(url_video, headers=HEADERS, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            baixado = 0
-            with open(mp4, "wb") as f:
-                for pedaco in r.iter_content(1024 * 256):
-                    baixado += len(pedaco)
-                    if baixado > MAX_MB_VIDEO * 1024 * 1024:
-                        raise RuntimeError("vídeo grande demais")
-                    f.write(pedaco)
-        # áudio mono 16 kHz: é o formato que o Whisper usa internamente
-        ok = subprocess.run(["ffmpeg", "-y", "-i", mp4, "-vn", "-ac", "1", "-ar", "16000", wav],
-                            capture_output=True).returncode == 0
-        if not ok:
-            raise RuntimeError("o ffmpeg não conseguiu extrair o áudio")
-        with TRAVA_WHISPER:
-            texto = _modelo().transcribe(wav, language="pt", fp16=False)["text"].strip()
-    finally:
-        for arq in (mp4, wav):
-            if os.path.exists(arq):
-                os.remove(arq)
-
-    os.makedirs(PASTA_TRANSCRICOES, exist_ok=True)
-    with open(cache, "w", encoding="utf-8") as f:
-        f.write(texto)
-    return texto
 
 
 
@@ -538,8 +504,6 @@ def executar(job_id, url_perfil, conta, max_videos):
                    mensagem="Nenhum vídeo apareceu nesse perfil. Confira o link — perfis privados ou inexistentes não funcionam.")
         return
 
-    transcrever = transcricao_disponivel()
-    urls_video = {}
     itens = []
     for pos, c in enumerate(cards, start=1):
         views = contagem_para_int(c["views_texto"])
@@ -548,8 +512,8 @@ def executar(job_id, url_perfil, conta, max_videos):
                       "titulo": c["titulo_grade"], "visualizacoes": views,
                       "fonte_views": "grade" if views is not None else "",
                       "curtidas": None, "comentarios": None, "compartilhamentos": None,
-                      "data_publicacao": "", "hora_publicacao": None, "legenda": "", "estado": "pendente",
-                      "transcricao": "", "estado_transcricao": "pendente" if transcrever else "desligado"})
+                      "data_publicacao": "", "hora_publicacao": None, "legenda": "", "duracao": None,
+                      "estado": "pendente"})
     _atualizar(job_id, itens=itens, perfil_info=info,
                mensagem=f"{len(itens)} vídeo(s) encontrados. Lendo os dados de cada um…")
 
@@ -568,53 +532,17 @@ def executar(job_id, url_perfil, conta, max_videos):
                     item["estado"] = "erro"
                 else:
                     for k in ("curtidas", "comentarios", "compartilhamentos", "data_publicacao",
-                              "hora_publicacao", "legenda"):
+                              "hora_publicacao", "legenda", "duracao"):
                         item[k] = m[k]
                     if not item["titulo"]:
                         item["titulo"] = (m["legenda"] or "")[:120]
-                    urls_video[item["id_video"]] = m.get("url_video")
                     item["estado"] = "ok"
                 feitos += 1
                 JOBS[job_id]["mensagem"] = f"Lendo os vídeos: {feitos}/{len(itens)}"
 
-    if not transcrever:
-        _atualizar(job_id, status="concluido", transcrevendo=False,
-                   mensagem=f"Pronto: {len(itens)} vídeo(s) de @{conta}.")
-        with TRAVA:
-            CACHE[(conta.lower(), max_videos)] = (time.time(), job_id)
-        return
-
-    # métricas prontas: o laudo já aparece; as transcrições chegam em seguida
-    _atualizar(job_id, status="concluido", transcrevendo=True,
-               mensagem=f"Dados prontos. Transcrevendo os {min(len(itens), MAX_TRANSCRICOES) if MAX_TRANSCRICOES > 0 else len(itens)} vídeos mais recentes: 0…")
+    _atualizar(job_id, status="concluido", mensagem=f"Pronto: {len(itens)} vídeo(s) de @{conta}.")
     with TRAVA:
         CACHE[(conta.lower(), max_videos)] = (time.time(), job_id)
-
-    # só os N mais recentes (pela data de publicação; sem data, pela ordem da grade)
-    recentes = sorted(itens, key=lambda i: (i["data_publicacao"] or "", i.get("hora_publicacao") or 0,
-                                            -i["posicao"]), reverse=True)
-    alvo = recentes[:MAX_TRANSCRICOES] if MAX_TRANSCRICOES > 0 else recentes
-    with TRAVA:
-        ids_alvo = {i["id_video"] for i in alvo}
-        for item in itens:
-            if item["id_video"] not in ids_alvo:
-                item["estado_transcricao"] = "fora"
-    total = len(alvo)
-
-    feitos = ok = 0
-    for item in alvo:
-        try:
-            texto = transcrever_video(item["id_video"], urls_video.get(item["id_video"]))
-            estado = "ok" if texto else "vazio"
-        except Exception:
-            texto, estado = "", "erro"
-        with TRAVA:
-            item["transcricao"], item["estado_transcricao"] = texto, estado
-            feitos += 1
-            ok += estado == "ok"
-            JOBS[job_id]["mensagem"] = f"Dados prontos. Transcrevendo os {total} vídeos mais recentes: {feitos}/{total}…"
-    _atualizar(job_id, transcrevendo=False,
-               mensagem=f"Pronto: {len(itens)} vídeo(s) de @{conta} · {ok} transcrição(ões).")
 
 
 def _limpar_antigos():
@@ -626,7 +554,7 @@ def _limpar_antigos():
         vivos = {jid for _, jid in CACHE.values()}
         for jid in list(JOBS):
             j = JOBS[jid]
-            if j["status"] != "rodando" and not j.get("transcrevendo") and jid not in vivos and j["criado"] < limite:
+            if j["status"] != "rodando" and jid not in vivos and j["criado"] < limite:
                 JOBS.pop(jid, None)
 
 
@@ -641,7 +569,7 @@ def pagina():
 
 @app.get("/api/ping")
 def ping():
-    return jsonify({"ok": True, "transcricao": transcricao_disponivel()})
+    return jsonify({"ok": True})
 
 
 @app.post("/api/coletar")
@@ -789,11 +717,12 @@ HTML = r"""<!doctype html>
   .chip { font-size: 13px; padding: 8px 14px; border-radius: 999px; background: var(--surface); color: var(--ink2); }
   .chip b { color: var(--ink); font-weight: 700; }
 
-  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
   .kpi { background: var(--surface); border-radius: var(--r-md); padding: 18px 20px; display: grid; gap: 6px; align-content: start; }
   .kpi:nth-child(1) { background: var(--accent-soft); }
   .kpi:nth-child(3) { background: var(--butter); }
   .kpi:nth-child(4) { background: var(--peach); }
+  .kpi:nth-child(6) { background: var(--accent-soft); }
   .kpi span { font-size: 13px; color: var(--ink2); }
   .kpi b { font: 700 25px/1.15 var(--display); letter-spacing: -0.02em; }
   .kpi small { font-size: 12.5px; color: var(--muted); }
@@ -820,7 +749,7 @@ HTML = r"""<!doctype html>
   .top5 small { color: var(--muted); font-size: 12px; display: block; }
 
   .tabela { overflow-x: auto; border-radius: var(--r-lg); background: var(--surface); padding: 6px 8px; }
-  table { border-collapse: collapse; width: 100%; min-width: 760px; font-size: 14px; }
+  table { border-collapse: collapse; width: 100%; min-width: 840px; font-size: 14px; }
   th, td { padding: 12px 14px; border-bottom: 1px solid var(--grid); text-align: left; vertical-align: top; }
   tbody tr:last-child td { border-bottom: 0; }
   th { font: 600 12px/1 var(--body); color: var(--muted); cursor: pointer; white-space: nowrap; user-select: none; }
@@ -835,11 +764,6 @@ HTML = r"""<!doctype html>
   td.t a.t-link:hover { text-decoration: underline; }
   td.t .t-link.vazio { color: var(--muted); }
   .vazio { color: var(--muted); }
-  details.tr { margin-top: 8px; }
-  details.tr summary { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--accent); width: max-content; }
-  details.tr p { margin: 8px 0 2px; font-size: 13.5px; line-height: 1.55; color: var(--ink); white-space: normal;
-                 max-height: 220px; overflow-y: auto; background: var(--sunken); border-radius: 14px; padding: 10px 14px; }
-  .tr-esp { display: block; margin-top: 6px; font-size: 12px; color: var(--muted); }
 
   #dica { position: absolute; pointer-events: none; background: var(--ink); color: var(--bg); font-size: 12.5px; line-height: 1.4;
           padding: 8px 11px; border-radius: 12px; max-width: 260px; z-index: 5; transform: translate(-50%, calc(-100% - 10px)); }
@@ -894,7 +818,7 @@ HTML = r"""<!doctype html>
     </div>
     <div class="acao">
       <button class="btn pri" type="button" id="analisar">Analisar perfil</button>
-      <button class="btn" type="button" id="baixar" hidden>Baixar CSV (com transcrições)</button>
+      <button class="btn" type="button" id="baixar" hidden>Baixar CSV</button>
       <span class="status-txt" id="status"></span>
     </div>
     <div class="barra" id="barra" hidden><i id="progresso"></i></div>
@@ -920,7 +844,7 @@ HTML = r"""<!doctype html>
 
   <div class="grade2">
     <section class="painel">
-      <h2>Dia em que mais posta vs dia em que mais engaja</h2>
+      <h2>Dia da semana: quando mais posta vs quando mais engaja</h2>
       <p class="sub">Esquerda: quantos vídeos saíram em cada dia. Direita: interações medianas por vídeo publicado naquele dia (curtidas + comentários).</p>
       <div class="grafico" id="g-dias"></div>
       <p class="conclusao" id="c-dias"></p>
@@ -932,6 +856,28 @@ HTML = r"""<!doctype html>
       <p class="conclusao" id="c-horas"></p>
     </section>
   </div>
+
+  <div class="grade2">
+    <section class="painel">
+      <h2>Duração: o tamanho que mais posta vs o que mais engaja</h2>
+      <p class="sub">Vídeos agrupados pela duração. Esquerda: quantos vídeos. Direita: interações medianas por vídeo.</p>
+      <div class="grafico" id="g-dur"></div>
+      <p class="conclusao" id="c-dur"></p>
+    </section>
+    <section class="painel">
+      <h2>Período do mês</h2>
+      <p class="sub">Início, meio ou fim do mês: quando a conta posta e quando engaja.</p>
+      <div class="grafico" id="g-tercos"></div>
+      <p class="conclusao" id="c-tercos"></p>
+    </section>
+  </div>
+
+  <section class="painel">
+    <h2>Mês a mês</h2>
+    <p class="sub">Vídeos publicados e interações medianas em cada mês. O primeiro e o último mês podem estar incompletos.</p>
+    <div class="grafico" id="g-meses"></div>
+    <p class="conclusao" id="c-meses"></p>
+  </section>
 
   <section class="painel">
     <h2>Engajamento de cada vídeo ao longo do tempo</h2>
@@ -970,6 +916,7 @@ HTML = r"""<!doctype html>
         <thead><tr>
           <th data-k="data" tabindex="0">Publicado</th>
           <th data-k="titulo" tabindex="0">Vídeo</th>
+          <th data-k="dur" class="n" tabindex="0">Duração</th>
           <th data-k="likes" class="n" tabindex="0">Curtidas</th>
           <th data-k="coms" class="n" tabindex="0">Coment.</th>
           <th data-k="int" class="n" tabindex="0">Interações</th>
@@ -1017,6 +964,13 @@ function numero(v) {
 const mediana = a => { if (!a.length) return null; const b = [...a].sort((x, y) => x - y); const m = b.length >> 1; return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; };
 const segunda = d => { const x = new Date(d); x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); x.setHours(0, 0, 0, 0); return x; };
 const faixaDe = h => h === null || h === undefined ? null : (h < 6 ? 0 : h < 12 ? 1 : h < 18 ? 2 : 3);
+const FAIXAS_DUR = [{rot: 'até 15s', nome: 'vídeos de até 15s', max: 15}, {rot: '15–30s', nome: 'vídeos de 15 a 30s', max: 30},
+                    {rot: '30s–1min', nome: 'vídeos de 30s a 1min', max: 60}, {rot: '1–3min', nome: 'vídeos de 1 a 3min', max: 180},
+                    {rot: '3min+', nome: 'vídeos de mais de 3min', max: Infinity}];
+const faixaDur = s => (s > 0) ? FAIXAS_DUR.findIndex(f => s <= f.max) : null;
+const fmtDur = s => s > 0 ? `${Math.floor(s / 60)}:${String(Math.round(s) % 60).padStart(2, '0')}` : '–';
+const TERCOS = [{rot: 'dias 1–10', nome: 'no início do mês'}, {rot: 'dias 11–20', nome: 'no meio do mês'}, {rot: 'dias 21–31', nome: 'no fim do mês'}];
+const MESES_LONGO = ['janeiro', 'fevereiro', 'março', 'abril', 'maio', 'junho', 'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'];
 
 // ---------- exemplo (claramente marcado) ----------
 function exemplo() {
@@ -1028,7 +982,8 @@ function exemplo() {
     const base = 900 * (dia === 4 ? 1.9 : dia === 0 ? 0.8 : 1) * (hora >= 18 ? 1.4 : 0.9) * (0.4 + rnd() * 1.4) * (rnd() > 0.93 ? 3 : 1);
     const likes = Math.round(base);
     out.push({id: String(5200000000000000000 + i), link: '', titulo: `Vídeo de exemplo ${40 - i}`, data: new Date(d), hora,
-      likes, coms: Math.round(likes * (0.02 + rnd() * 0.06)), conta: 'contaexemplo', seguidores: 185000, coleta: ''});
+      likes, coms: Math.round(likes * (0.02 + rnd() * 0.06)), conta: 'contaexemplo', seguidores: 185000, coleta: '',
+      dur: [9, 14, 22, 28, 38, 52, 70, 95, 140, 210][Math.floor(rnd() * 10)]});
     d = new Date(d.getTime() - Math.floor(rnd() * rnd() * 5) * DIA);
   }
   return out;
@@ -1069,6 +1024,17 @@ function analisar(todos, qtd, segManual) {
   const dias7 = grupos(vids, v => (v.data.getDay() + 6) % 7, 7);
   const comHora = vids.filter(v => v.hora !== null && v.hora !== undefined).length;
   const faixas = comHora >= Math.max(3, n * 0.5) ? grupos(vids, v => faixaDe(v.hora), 4) : null;
+  // duração, período do mês e mês a mês
+  const comDur = vids.filter(v => v.dur > 0).length;
+  const duracoes = comDur >= Math.max(3, n * 0.5) ? grupos(vids, v => faixaDur(v.dur), FAIXAS_DUR.length) : null;
+  const medDur = mediana(vids.filter(v => v.dur > 0).map(v => v.dur));
+  const tercos = grupos(vids, v => { const d = v.data.getDate(); return d <= 10 ? 0 : d <= 20 ? 1 : 2; }, 3);
+  const chaveMes = d => d.getFullYear() * 12 + d.getMonth();
+  const listaMeses = [...new Set(vids.map(v => chaveMes(v.data)))].sort((a, b) => a - b);
+  const meses = grupos(vids, v => listaMeses.indexOf(chaveMes(v.data)), listaMeses.length);
+  const umAno = new Set(listaMeses.map(k => Math.floor(k / 12))).size === 1;
+  meses.rotulos = listaMeses.map(k => MESES[k % 12] + (umAno ? '' : '/' + String(Math.floor(k / 12)).slice(2)));
+  meses.nomes = listaMeses.map(k => 'em ' + MESES_LONGO[k % 12] + (umAno ? '' : ' de ' + Math.floor(k / 12)));
 
   // tendência: últimos k vs k anteriores
   let tend = null;
@@ -1094,6 +1060,7 @@ function analisar(todos, qtd, segManual) {
 
   return {vids, n, antigo, recente, dias, porSemana, semanas, semanasVazias: semanas.filter(s => !s.n).length, intervalos, maiorHiato,
     diasComPost: new Set(vids.map(v => v.data.toDateString())).size, medInt, L, C, dias7, faixas, comHora, tend, freqEng,
+    comDur, duracoes, medDur, tercos, meses,
     seguidores, fonteSeg: segManual ? 'informado' : (segArq ? 'perfil' : null), fora, campeao, nInt: ints.length,
     conta: (todos.find(v => v.conta) || {}).conta || '', coleta: (todos.find(v => v.coleta) || {}).coleta || ''};
 }
@@ -1108,12 +1075,29 @@ const variacao = x => (x >= 0 ? '+' : '−') + nf(Math.abs(x) * 100, 0) + '%';
 function conclusaoGrupo(G, nomes, quando) {
   if (!G || G.melhor === null) return 'Ainda não há vídeos suficientes com curtidas para comparar.';
   const p = G.g[G.maisPosta], m = G.g[G.melhor];
+  if (G.g.filter(x => x.n === p.n).length > 1)          // empate: não existe "posta mais"
+    return `A conta distribui os posts sem um período dominante. Engaja mais ${nomes[G.melhor]}: <b>${compacto(m.med)} interações</b> por vídeo (mediana).` +
+      (m.n <= 2 ? ` Só ${m.n} vídeo(s) ${quando} ${nomes[G.melhor]}: vale testar mais antes de concluir.` : '');
   if (G.maisPosta === G.melhor)
     return `A conta posta mais ${nomes[G.maisPosta]} e é também quando engaja mais: <b>${compacto(m.med)} interações</b> por vídeo (mediana). Estratégia alinhada.`;
   const ganho = p.med ? m.med / p.med - 1 : null;
   return `Posta mais ${nomes[G.maisPosta]} (${p.n} vídeos), mas engaja mais ${nomes[G.melhor]}: <b>${compacto(m.med)} interações</b> por vídeo` +
     (ganho !== null && isFinite(ganho) ? `, <b>${variacao(ganho)}</b> que ${nomes[G.maisPosta]}` : '') +
     `. ${m.n <= 2 ? `Só ${m.n} vídeo(s) ${quando} ${nomes[G.melhor]}: vale testar mais antes de concluir.` : 'Vale concentrar mais posts aí.'}`;
+}
+
+function conclusaoDur(G) {
+  if (!G || G.melhor === null) return 'Ainda não há vídeos suficientes com duração para comparar.';
+  const p = G.g[G.maisPosta], m = G.g[G.melhor], nomes = FAIXAS_DUR.map(f => f.nome);
+  if (G.g.filter(x => x.n === p.n).length > 1)          // empate: não existe "a maior parte"
+    return `A conta varia a duração sem um tamanho dominante. Os que mais engajam são os ${nomes[G.melhor]}: <b>${compacto(m.med)} interações</b> por vídeo (mediana).` +
+      (m.n <= 2 ? ` Só ${m.n} vídeo(s) nessa faixa: vale testar mais antes de concluir.` : ' Vale produzir mais nesse formato.');
+  if (G.maisPosta === G.melhor)
+    return `A maior parte são ${nomes[G.maisPosta]} (${p.n}) e são também os que mais engajam: <b>${compacto(m.med)} interações</b> por vídeo (mediana). Formato alinhado.`;
+  const ganho = p.med ? m.med / p.med - 1 : null;
+  return `A maior parte são ${nomes[G.maisPosta]} (${p.n}), mas os que mais engajam são os ${nomes[G.melhor]}: <b>${compacto(m.med)} interações</b> por vídeo` +
+    (ganho !== null && isFinite(ganho) ? `, <b>${variacao(ganho)}</b>` : '') +
+    `. ${m.n <= 2 ? `Só ${m.n} vídeo(s) nessa faixa: vale testar mais antes de concluir.` : 'Vale produzir mais nesse formato.'}`;
 }
 
 // ---------- gráficos ----------
@@ -1137,9 +1121,9 @@ function escalaBonita(max, passos = 4) {
 const larg = el => Math.max(280, Math.floor(el.clientWidth || el.parentElement.clientWidth || 560));
 
 // duas colunas lado a lado, cada uma com sua própria escala: vídeos postados | interações medianas
-function barrasPar(el, G, rotulos) {
-  if (!G) { el.innerHTML = '<p class="vazio" style="margin:0">O Kwai não informou o horário de publicação desses vídeos.</p>'; return; }
-  const W = larg(el), l = 52, gap = 22, r = 6, lh = 28, topo = 22, H = topo + rotulos.length * lh + 4;
+function barrasPar(el, G, rotulos, semDados = 'O Kwai não informou o horário de publicação desses vídeos.') {
+  if (!G) { el.innerHTML = `<p class="vazio" style="margin:0">${semDados}</p>`; return; }
+  const W = larg(el), l = Math.max(52, Math.round(Math.max(...rotulos.map(r => r.length)) * 6.6) + 16), gap = 22, r = 6, lh = 28, topo = 22, H = topo + rotulos.length * lh + 4;
   const pw = (W - l - gap - r) / 2, num = 58, bw = pw - num;
   const maxN = Math.max(...G.g.map(x => x.n), 1), maxM = Math.max(...G.g.map(x => x.med || 0), 1);
   let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Vídeos postados e interações medianas">
@@ -1220,6 +1204,9 @@ function normPerfil(t) {
 function desenhar(A) {
   barrasPar($('#g-dias'), A.dias7, DIAS_CURTO);
   barrasPar($('#g-horas'), A.faixas, FAIXAS.map(f => f.rot));
+  barrasPar($('#g-dur'), A.duracoes, FAIXAS_DUR.map(f => f.rot), 'O Kwai não informou a duração desses vídeos.');
+  barrasPar($('#g-tercos'), A.tercos, TERCOS.map(t => t.rot));
+  barrasPar($('#g-meses'), A.meses, A.meses.rotulos);
   graficoEng($('#g-eng'), A); graficoSemanas($('#g-semanas'), A);
 }
 
@@ -1255,6 +1242,7 @@ function render(aoVivo) {
     ['Interações por vídeo', compacto(A.medInt), 'mediana de curtidas + comentários'],
     ['A cada 1.000 seguidores', por1000 !== null ? nf(por1000, por1000 < 10 ? 1 : 0) : '–', por1000 !== null ? 'interagem com um vídeo típico' : 'precisa dos seguidores'],
     ['Seguidores', A.seguidores ? compacto(A.seguidores) : '–', A.seguidores ? (A.fonteSeg === 'informado' ? 'informado por você' : 'lido do perfil') : 'informe no campo acima'],
+    ['Duração típica', A.medDur ? fmtDur(A.medDur) : '–', A.comDur ? `mediana · ${A.comDur} de ${A.n} vídeos` : 'duração não informada'],
   ].map(([r, v, s]) => `<div class="kpi"><span>${r}</span><b>${v}</b><small>${s}</small></div>`).join('');
 
   // insights
@@ -1269,6 +1257,16 @@ function render(aoVivo) {
   }
   if (A.tend) ins.push(`<b>Tendência:</b> os últimos ${A.tend.k} vídeos têm mediana de ${compacto(A.tend.rec)} interações, contra ${compacto(A.tend.ant)} dos ${A.tend.k} anteriores (${variacao(A.tend.var)}). ${A.tend.var < -0.15 ? 'O engajamento está caindo.' : A.tend.var > 0.15 ? 'O engajamento está subindo.' : 'Estável.'}`);
   if (A.freqEng) ins.push(`<b>Volume x engajamento:</b> nas semanas com mais de ${nf(A.freqEng.corte)} posts, cada vídeo teve ${compacto(A.freqEng.cheias)} interações (mediana), contra ${compacto(A.freqEng.leves)} nas semanas mais leves. ${A.freqEng.cheias < A.freqEng.leves * 0.85 ? 'Postar mais está diluindo o engajamento.' : A.freqEng.cheias > A.freqEng.leves * 1.15 ? 'Postar mais está puxando o engajamento pra cima.' : 'Postar mais não mudou o engajamento por vídeo.'}`);
+  if (A.duracoes && A.duracoes.melhor !== null && A.duracoes.melhor !== A.duracoes.maisPosta) {
+    const G = A.duracoes, g = G.g[G.melhor].med / (G.g[G.maisPosta].med || 1) - 1;
+    const empate = G.g.filter(x => x.n === G.g[G.maisPosta].n).length > 1;
+    ins.push(empate ? `<b>Duração:</b> os ${FAIXAS_DUR[G.melhor].nome} são os que mais engajam (${compacto(G.g[G.melhor].med)} interações por vídeo).`
+                    : `<b>Duração:</b> a maioria são ${FAIXAS_DUR[G.maisPosta].nome}, mas os ${FAIXAS_DUR[G.melhor].nome} engajam ${variacao(g)}.`);
+  }
+  if (A.tercos.melhor !== null && A.tercos.melhor !== A.tercos.maisPosta) {
+    const G = A.tercos, g = G.g[G.melhor].med / (G.g[G.maisPosta].med || 1) - 1;
+    ins.push(`<b>Período do mês:</b> posta mais ${TERCOS[G.maisPosta].nome}, mas engaja mais ${TERCOS[G.melhor].nome} (${variacao(g)}).`);
+  }
   if (A.maiorHiato && A.maiorHiato.d >= 5) ins.push(`<b>Pausa:</b> ficou ${A.maiorHiato.d} dias sem postar (${dataCurta(A.maiorHiato.de)} → ${dataCurta(A.maiorHiato.ate)}).`);
   if (A.L) { const c100 = A.C / A.L * 100; ins.push(`<b>Conversa:</b> ${nf(c100, 1)} comentários a cada 100 curtidas. ${c100 < 3 ? 'O público curte, mas pouco conversa: perguntas diretas e chamadas pra comentar ajudam.' : c100 > 8 ? 'Público que conversa bastante: bom sinal de comunidade.' : 'Nível de conversa moderado.'}`); }
   if (A.campeao && A.campeao.rel) ins.push(`<b>O que funciona:</b> o melhor vídeo (${dataCurta(A.campeao.data)}) teve ${nf(A.campeao.rel, 1)}× a mediana. ${A.fora.length > 1 ? `Outros ${A.fora.length - 1} também passaram de 2×: vale ver o que eles têm em comum.` : 'Vale entender o que ele fez de diferente.'}`);
@@ -1277,6 +1275,12 @@ function render(aoVivo) {
   $('#c-dias').innerHTML = conclusaoGrupo(D, DIAS_NOS, 'publicado(s)');
   $('#c-horas').innerHTML = A.faixas ? conclusaoGrupo(A.faixas, FAIXAS.map(f => f.nome), 'publicado(s)') : `Só ${A.comHora} de ${A.n} vídeos trouxeram o horário — pouco pra comparar.`;
   $('#c-horas').hidden = !A.faixas && A.comHora === 0;
+  $('#c-dur').innerHTML = A.duracoes ? conclusaoDur(A.duracoes)
+    : (A.comDur ? `Só ${A.comDur} de ${A.n} vídeos trouxeram a duração — pouco pra comparar.` : 'Sem a duração dos vídeos não dá pra comparar.');
+  $('#c-tercos').innerHTML = conclusaoGrupo(A.tercos, TERCOS.map(t => t.nome), 'publicado(s)');
+  $('#c-meses').innerHTML = A.meses.g.length < 2
+    ? 'Todos os vídeos analisados são do mesmo mês. Escolha "Últimos 80" pra comparar meses.'
+    : conclusaoGrupo(A.meses, A.meses.nomes, 'publicado(s)');
 
   $('#sub-eng').textContent = 'Cada ponto é um vídeo (curtidas + comentários) · ponto maior = 2× a mediana ou mais · linha clara = mediana dos últimos 5 vídeos';
   $('#stats-eng').innerHTML = [
@@ -1315,17 +1319,11 @@ function render(aoVivo) {
   $('#nota-final').textContent = notas.join(' ');
 }
 
-function celTranscricao(v) {
-  if (v.transcricao) return `<details class="tr"><summary>ver transcrição</summary><p>${esc(v.transcricao)}</p></details>`;
-  if (v.estTr === 'pendente') return '<span class="tr-esp">transcrevendo…</span>';
-  if (v.estTr === 'erro') return '<span class="tr-esp">não deu pra transcrever</span>';
-  if (v.estTr === 'vazio') return '<span class="tr-esp">sem fala no áudio</span>';
-  return '';
-}
 function baixarCSV() {
-  const cols = [['data', v => v.data ? v.data.toISOString().slice(0, 10) : ''], ['hora', v => v.hora ?? ''],
-    ['link', v => v.link], ['legenda', v => v.legenda || v.titulo], ['curtidas', v => v.likes ?? ''],
-    ['comentarios', v => v.coms ?? ''], ['transcricao', v => v.transcricao || '']];
+  const cols = [['data', v => v.data ? `${v.data.getFullYear()}-${String(v.data.getMonth() + 1).padStart(2, '0')}-${String(v.data.getDate()).padStart(2, '0')}` : ''],
+    ['hora', v => v.hora ?? ''], ['dia_semana', v => v.data ? DIAS_CURTO[(v.data.getDay() + 6) % 7] : ''],
+    ['duracao_segundos', v => v.dur ?? ''], ['link', v => v.link], ['legenda', v => v.legenda || v.titulo],
+    ['curtidas', v => v.likes ?? ''], ['comentarios', v => v.coms ?? '']];
   const q = x => '"' + String(x ?? '').replace(/"/g, '""').replace(/\r?\n/g, ' ') + '"';
   const linhas = [cols.map(c => c[0]).join(';'), ...TODOS.map(v => cols.map(c => q(c[1](v))).join(';'))];
   const blob = new Blob(['\ufeff' + linhas.join('\r\n')], {type: 'text/csv;charset=utf-8'});
@@ -1344,7 +1342,8 @@ function tabela(A) {
     <td class="mono" style="white-space:nowrap">${dataLonga(v.data)}<br><span class="hora">${DIAS_CURTO[(v.data.getDay() + 6) % 7]}${v.hora !== null && v.hora !== undefined ? ` · ${v.hora}h` : ''}</span></td>
     <td class="t"><span class="t-tit" title="${esc(v.titulo)}">${esc(v.titulo)}</span>${v.link
       ? `<a class="t-link" href="${esc(v.link)}" target="_blank" rel="noopener">${esc(v.link.replace(/^https?:\/\/(www\.)?/, ''))} ↗</a>`
-      : `<span class="t-link vazio">sem link (vídeo de exemplo)</span>`}${celTranscricao(v)}</td>
+      : `<span class="t-link vazio">sem link (vídeo de exemplo)</span>`}</td>
+    <td class="n">${v.dur > 0 ? fmtDur(v.dur) : '<span class="vazio">–</span>'}</td>
     <td class="n">${cel(v.likes)}</td><td class="n">${cel(v.coms)}</td><td class="n">${cel(v.int)}</td>
     <td class="n">${v.rel ? nf(v.rel, 1) + '×' : '–'}</td><td class="n">${v.pseg !== null ? pct(v.pseg, 2) : '–'}</td></tr>`).join('');
   document.querySelectorAll('th[data-k]').forEach(th => th.setAttribute('aria-sort', th.dataset.k === k ? (dir === 'asc' ? 'ascending' : 'descending') : 'none'));
@@ -1367,7 +1366,7 @@ function deJob(job) {
   return (job.itens || []).map(it => ({
     id: it.id_video, link: it.link, titulo: it.titulo || it.legenda || 'Sem legenda',
     data: dataDe(it.data_publicacao), hora: it.hora_publicacao ?? null, likes: it.curtidas ?? null, coms: it.comentarios ?? null,
-    legenda: it.legenda || '', transcricao: it.transcricao || '', estTr: it.estado_transcricao || '',
+    dur: it.duracao ?? null, legenda: it.legenda || '',
     conta: job.conta, seguidores: seg ?? null, coleta: (job.inicio || '').slice(0, 10),
   }));
 }
@@ -1376,7 +1375,7 @@ async function analisarPerfil() {
   const perfil = normPerfil($('#perfil').value);
   if (!perfil) { erro('Cole o link do perfil, por exemplo https://www.kwai.com/@Lulaoficial'); return; }
   if (!ROBO) { $('#sem-robo').hidden = false; erro(''); return; }
-  erro(''); rodando = true; $('#analisar').disabled = true; $('#baixar').hidden = true; let assinatura = ''; $('#barra').hidden = false; $('#progresso').style.width = '4%';
+  erro(''); rodando = true; $('#analisar').disabled = true; $('#baixar').hidden = true; $('#barra').hidden = false; $('#progresso').style.width = '4%';
   status('Iniciando…', true);
   try {
     const r = await fetch('api/coletar', {method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -1388,17 +1387,12 @@ async function analisarPerfil() {
       const job = await (await fetch('api/job/' + j.job)).json();
       if (job.erro) throw new Error(job.erro);
       const itens = job.itens || [], feitos = itens.filter(i => i.estado !== 'pendente').length;
-      const transcritos = itens.filter(i => i.estado_transcricao && i.estado_transcricao !== 'pendente').length;
-      $('#progresso').style.width = !itens.length ? '10%'
-        : job.transcrevendo ? (100 * transcritos / itens.length) + '%' : (15 + 85 * feitos / itens.length) + '%';   // "fora" já conta como feito
-      const conv = deJob(job), nova = `${feitos}/${transcritos}/${job.status}`;
-      if (nova !== assinatura && conv.some(v => v.data)) {        // só redesenha quando algo mudou
-        assinatura = nova; TODOS = conv; EXEMPLO = false; render(true);
-        $('#baixar').hidden = job.status === 'rodando';
-      }
-      if (job.status !== 'rodando' && !job.transcrevendo) {
+      $('#progresso').style.width = itens.length ? (15 + 85 * feitos / itens.length) + '%' : '10%';
+      const conv = deJob(job);
+      if (conv.some(v => v.data)) { TODOS = conv; EXEMPLO = false; render(true); }
+      if (job.status !== 'rodando') {
         if (job.status === 'erro') { erro(job.mensagem); status(''); }
-        else { status(job.mensagem); $('#progresso').style.width = '100%'; render(); }
+        else { status(job.mensagem); $('#progresso').style.width = '100%'; render(); $('#baixar').hidden = false; }
         break;
       }
       status(job.mensagem, true);
