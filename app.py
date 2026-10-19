@@ -5,7 +5,9 @@ RAIO-X KWAI — site público
 Qualquer pessoa abre o site, cola o link de um perfil do Kwai e clica em
 Analisar. O servidor puxa os links dos últimos vídeos (mesma coleta do robô
 de links, em modo celular), lê views/curtidas/comentários/data de cada um e
-a página monta o laudo na hora.
+a página monta o laudo na hora. Depois, em segundo plano, baixa o áudio
+de cada vídeo e TRANSCREVE localmente com o Whisper (mesma lógica do
+notebook do Colab) — a transcrição vai aparecendo na tabela e no CSV.
 
 Proteções pra uso público:
   - FILA: no máximo COLETAS_SIMULTANEAS navegadores ao mesmo tempo; quem
@@ -14,6 +16,11 @@ Proteções pra uso público:
     resultado pronto, sem abrir o navegador de novo.
   - LIMITE POR PESSOA: no máximo MAX_POR_IP análises em andamento por IP.
 
+Transcrição: precisa de `openai-whisper` (pip) e do `ffmpeg` (sistema).
+  TRANSCREVER=0 desliga · MODELO_WHISPER=tiny/base/small (padrão: base).
+  Os textos ficam em PASTA_TRANSCRICOES (cache: vídeo já transcrito não
+  é transcrito de novo).
+
 Rodar local:  pip install -r requirements.txt && python app.py
 Publicar:     veja o README.md (Hugging Face Spaces, grátis).
 """
@@ -21,6 +28,8 @@ Publicar:     veja o README.md (Hugging Face Spaces, grátis).
 import os
 import random
 import re
+import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -35,6 +44,11 @@ CACHE_HORAS = float(os.environ.get("CACHE_HORAS", "6"))
 MAX_POR_IP = int(os.environ.get("MAX_POR_IP", "2"))
 MAX_VIDEOS_TETO = 80
 TRABALHADORES_PAGINA = 4
+TRANSCREVER = os.environ.get("TRANSCREVER", "1") != "0"
+MODELO_WHISPER = os.environ.get("MODELO_WHISPER", "base")      # tiny / base / small / medium
+PASTA_TRANSCRICOES = os.environ.get("PASTA_TRANSCRICOES", "transcricoes")
+PASTA_TMP = os.environ.get("PASTA_TMP", "/tmp/kwai_audio")
+MAX_MB_VIDEO = 300
 FUSO_BR = timezone(timedelta(hours=-3))
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -395,7 +409,79 @@ def metricas_da_pagina(link, video_id):
                 break
 
     out["data_publicacao"], out["hora_publicacao"], out["fonte_data"] = _data_publicacao(html, video_id)
+    out["url_video"] = _url_video(html)
     return out
+
+
+# ----------------------------------------------------------------------
+# 3) TRANSCRIÇÃO LOCAL (Whisper) — mesma lógica do notebook do Colab:
+#    baixa o .mp4 → ffmpeg extrai o áudio → Whisper transcreve
+# ----------------------------------------------------------------------
+
+_MODELO_WHISPER = None
+TRAVA_WHISPER = threading.Lock()      # um áudio por vez (Whisper pesa e não é thread-safe)
+
+
+def transcricao_disponivel():
+    if not TRANSCREVER or shutil.which("ffmpeg") is None:
+        return False
+    try:
+        import whisper  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _modelo():
+    global _MODELO_WHISPER
+    if _MODELO_WHISPER is None:
+        import whisper
+        _MODELO_WHISPER = whisper.load_model(MODELO_WHISPER)
+    return _MODELO_WHISPER
+
+
+def _cache_transcricao(video_id):
+    return os.path.join(PASTA_TRANSCRICOES, f"kwai_{video_id}.txt")
+
+
+def transcrever_video(video_id, url_video):
+    """Devolve o texto falado no vídeo. Usa o cache em disco se já existir."""
+    cache = _cache_transcricao(video_id)
+    if os.path.exists(cache):
+        with open(cache, encoding="utf-8") as f:
+            return f.read().strip()
+    if not url_video:
+        raise RuntimeError("a página não trouxe o arquivo de vídeo")
+
+    os.makedirs(PASTA_TMP, exist_ok=True)
+    mp4 = os.path.join(PASTA_TMP, f"{video_id}_{uuid.uuid4().hex[:6]}.mp4")
+    wav = mp4[:-4] + ".wav"
+    try:
+        with requests.get(url_video, headers=HEADERS, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            baixado = 0
+            with open(mp4, "wb") as f:
+                for pedaco in r.iter_content(1024 * 256):
+                    baixado += len(pedaco)
+                    if baixado > MAX_MB_VIDEO * 1024 * 1024:
+                        raise RuntimeError("vídeo grande demais")
+                    f.write(pedaco)
+        # áudio mono 16 kHz: é o formato que o Whisper usa internamente
+        ok = subprocess.run(["ffmpeg", "-y", "-i", mp4, "-vn", "-ac", "1", "-ar", "16000", wav],
+                            capture_output=True).returncode == 0
+        if not ok:
+            raise RuntimeError("o ffmpeg não conseguiu extrair o áudio")
+        with TRAVA_WHISPER:
+            texto = _modelo().transcribe(wav, language="pt", fp16=False)["text"].strip()
+    finally:
+        for arq in (mp4, wav):
+            if os.path.exists(arq):
+                os.remove(arq)
+
+    os.makedirs(PASTA_TRANSCRICOES, exist_ok=True)
+    with open(cache, "w", encoding="utf-8") as f:
+        f.write(texto)
+    return texto
 
 
 
@@ -449,6 +535,8 @@ def executar(job_id, url_perfil, conta, max_videos):
                    mensagem="Nenhum vídeo apareceu nesse perfil. Confira o link — perfis privados ou inexistentes não funcionam.")
         return
 
+    transcrever = transcricao_disponivel()
+    urls_video = {}
     itens = []
     for pos, c in enumerate(cards, start=1):
         views = contagem_para_int(c["views_texto"])
@@ -457,7 +545,8 @@ def executar(job_id, url_perfil, conta, max_videos):
                       "titulo": c["titulo_grade"], "visualizacoes": views,
                       "fonte_views": "grade" if views is not None else "",
                       "curtidas": None, "comentarios": None, "compartilhamentos": None,
-                      "data_publicacao": "", "hora_publicacao": None, "legenda": "", "estado": "pendente"})
+                      "data_publicacao": "", "hora_publicacao": None, "legenda": "", "estado": "pendente",
+                      "transcricao": "", "estado_transcricao": "pendente" if transcrever else "desligado"})
     _atualizar(job_id, itens=itens, perfil_info=info,
                mensagem=f"{len(itens)} vídeo(s) encontrados. Lendo os dados de cada um…")
 
@@ -480,13 +569,38 @@ def executar(job_id, url_perfil, conta, max_videos):
                         item[k] = m[k]
                     if not item["titulo"]:
                         item["titulo"] = (m["legenda"] or "")[:120]
+                    urls_video[item["id_video"]] = m.get("url_video")
                     item["estado"] = "ok"
                 feitos += 1
                 JOBS[job_id]["mensagem"] = f"Lendo os vídeos: {feitos}/{len(itens)}"
 
-    _atualizar(job_id, status="concluido", mensagem=f"Pronto: {len(itens)} vídeo(s) de @{conta}.")
+    if not transcrever:
+        _atualizar(job_id, status="concluido", transcrevendo=False,
+                   mensagem=f"Pronto: {len(itens)} vídeo(s) de @{conta}.")
+        with TRAVA:
+            CACHE[(conta.lower(), max_videos)] = (time.time(), job_id)
+        return
+
+    # métricas prontas: o laudo já aparece; as transcrições chegam em seguida
+    _atualizar(job_id, status="concluido", transcrevendo=True,
+               mensagem=f"Dados prontos. Transcrevendo os áudios: 0/{len(itens)}…")
     with TRAVA:
         CACHE[(conta.lower(), max_videos)] = (time.time(), job_id)
+
+    feitos = ok = 0
+    for item in sorted(itens, key=lambda i: i["posicao"]):
+        try:
+            texto = transcrever_video(item["id_video"], urls_video.get(item["id_video"]))
+            estado = "ok" if texto else "vazio"
+        except Exception:
+            texto, estado = "", "erro"
+        with TRAVA:
+            item["transcricao"], item["estado_transcricao"] = texto, estado
+            feitos += 1
+            ok += estado == "ok"
+            JOBS[job_id]["mensagem"] = f"Dados prontos. Transcrevendo os áudios: {feitos}/{len(itens)}…"
+    _atualizar(job_id, transcrevendo=False,
+               mensagem=f"Pronto: {len(itens)} vídeo(s) de @{conta} · {ok} transcrição(ões).")
 
 
 def _limpar_antigos():
@@ -498,7 +612,7 @@ def _limpar_antigos():
         vivos = {jid for _, jid in CACHE.values()}
         for jid in list(JOBS):
             j = JOBS[jid]
-            if j["status"] != "rodando" and jid not in vivos and j["criado"] < limite:
+            if j["status"] != "rodando" and not j.get("transcrevendo") and jid not in vivos and j["criado"] < limite:
                 JOBS.pop(jid, None)
 
 
@@ -513,7 +627,7 @@ def pagina():
 
 @app.get("/api/ping")
 def ping():
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "transcricao": transcricao_disponivel()})
 
 
 @app.post("/api/coletar")
@@ -689,6 +803,11 @@ HTML = r"""<!doctype html>
   td.t a.t-link:hover { text-decoration: underline; }
   td.t .t-link.vazio { color: var(--muted); }
   .vazio { color: var(--muted); }
+  details.tr { margin-top: 6px; }
+  details.tr summary { cursor: pointer; font: 500 12px/1.4 var(--mono); color: var(--ink2); }
+  details.tr p { margin: 6px 0 2px; font-size: 13.5px; line-height: 1.5; color: var(--ink); white-space: normal;
+                 max-height: 220px; overflow-y: auto; background: var(--sunken); border-radius: 8px; padding: 8px 10px; }
+  .tr-esp { display: block; margin-top: 4px; font: 12px/1.4 var(--mono); color: var(--muted); }
 
   #dica { position: absolute; pointer-events: none; background: var(--ink); color: var(--bg); font-size: 12.5px; line-height: 1.4;
           padding: 7px 9px; border-radius: 8px; max-width: 260px; z-index: 5; transform: translate(-50%, calc(-100% - 10px)); }
@@ -733,6 +852,7 @@ HTML = r"""<!doctype html>
     </div>
     <div class="acao">
       <button class="btn pri" type="button" id="analisar">Analisar perfil</button>
+      <button class="btn" type="button" id="baixar" hidden>Baixar CSV (com transcrições)</button>
       <span class="status-txt" id="status"></span>
     </div>
     <div class="barra" id="barra" hidden><i id="progresso"></i></div>
@@ -1153,6 +1273,25 @@ function render(aoVivo) {
   $('#nota-final').textContent = notas.join(' ');
 }
 
+function celTranscricao(v) {
+  if (v.transcricao) return `<details class="tr"><summary>ver transcrição</summary><p>${esc(v.transcricao)}</p></details>`;
+  if (v.estTr === 'pendente') return '<span class="tr-esp">transcrevendo…</span>';
+  if (v.estTr === 'erro') return '<span class="tr-esp">não deu pra transcrever</span>';
+  if (v.estTr === 'vazio') return '<span class="tr-esp">sem fala no áudio</span>';
+  return '';
+}
+function baixarCSV() {
+  const cols = [['data', v => v.data ? v.data.toISOString().slice(0, 10) : ''], ['hora', v => v.hora ?? ''],
+    ['link', v => v.link], ['legenda', v => v.legenda || v.titulo], ['curtidas', v => v.likes ?? ''],
+    ['comentarios', v => v.coms ?? ''], ['transcricao', v => v.transcricao || '']];
+  const q = x => '"' + String(x ?? '').replace(/"/g, '""').replace(/\r?\n/g, ' ') + '"';
+  const linhas = [cols.map(c => c[0]).join(';'), ...TODOS.map(v => cols.map(c => q(c[1](v))).join(';'))];
+  const blob = new Blob(['\ufeff' + linhas.join('\r\n')], {type: 'text/csv;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `kwai_${(TODOS[0] && TODOS[0].conta) || 'perfil'}_${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
 function tabela(A) {
   const {k, dir} = ORDEM, f = dir === 'asc' ? 1 : -1;
   const rows = [...A.vids].sort((a, b) => { const x = a[k], y = b[k];
@@ -1163,7 +1302,7 @@ function tabela(A) {
     <td class="mono" style="white-space:nowrap">${dataLonga(v.data)}<br><span class="hora">${DIAS_CURTO[(v.data.getDay() + 6) % 7]}${v.hora !== null && v.hora !== undefined ? ` · ${v.hora}h` : ''}</span></td>
     <td class="t"><span class="t-tit" title="${esc(v.titulo)}">${esc(v.titulo)}</span>${v.link
       ? `<a class="t-link" href="${esc(v.link)}" target="_blank" rel="noopener">${esc(v.link.replace(/^https?:\/\/(www\.)?/, ''))} ↗</a>`
-      : `<span class="t-link vazio">sem link (vídeo de exemplo)</span>`}</td>
+      : `<span class="t-link vazio">sem link (vídeo de exemplo)</span>`}${celTranscricao(v)}</td>
     <td class="n">${cel(v.likes)}</td><td class="n">${cel(v.coms)}</td><td class="n">${cel(v.int)}</td>
     <td class="n">${v.rel ? nf(v.rel, 1) + '×' : '–'}</td><td class="n">${v.pseg !== null ? pct(v.pseg, 2) : '–'}</td></tr>`).join('');
   document.querySelectorAll('th[data-k]').forEach(th => th.setAttribute('aria-sort', th.dataset.k === k ? (dir === 'asc' ? 'ascending' : 'descending') : 'none'));
@@ -1186,6 +1325,7 @@ function deJob(job) {
   return (job.itens || []).map(it => ({
     id: it.id_video, link: it.link, titulo: it.titulo || it.legenda || 'Sem legenda',
     data: dataDe(it.data_publicacao), hora: it.hora_publicacao ?? null, likes: it.curtidas ?? null, coms: it.comentarios ?? null,
+    legenda: it.legenda || '', transcricao: it.transcricao || '', estTr: it.estado_transcricao || '',
     conta: job.conta, seguidores: seg ?? null, coleta: (job.inicio || '').slice(0, 10),
   }));
 }
@@ -1194,7 +1334,7 @@ async function analisarPerfil() {
   const perfil = normPerfil($('#perfil').value);
   if (!perfil) { erro('Cole o link do perfil, por exemplo https://www.kwai.com/@Lulaoficial'); return; }
   if (!ROBO) { $('#sem-robo').hidden = false; erro(''); return; }
-  erro(''); rodando = true; $('#analisar').disabled = true; $('#barra').hidden = false; $('#progresso').style.width = '4%';
+  erro(''); rodando = true; $('#analisar').disabled = true; $('#baixar').hidden = true; let assinatura = ''; $('#barra').hidden = false; $('#progresso').style.width = '4%';
   status('Iniciando…', true);
   try {
     const r = await fetch('api/coletar', {method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -1206,10 +1346,15 @@ async function analisarPerfil() {
       const job = await (await fetch('api/job/' + j.job)).json();
       if (job.erro) throw new Error(job.erro);
       const itens = job.itens || [], feitos = itens.filter(i => i.estado !== 'pendente').length;
-      $('#progresso').style.width = itens.length ? (15 + 85 * feitos / itens.length) + '%' : '10%';
-      const conv = deJob(job);
-      if (conv.some(v => v.data)) { TODOS = conv; EXEMPLO = false; render(true); }
-      if (job.status !== 'rodando') {
+      const transcritos = itens.filter(i => i.estado_transcricao && i.estado_transcricao !== 'pendente').length;
+      $('#progresso').style.width = !itens.length ? '10%'
+        : job.transcrevendo ? (100 * transcritos / itens.length) + '%' : (15 + 85 * feitos / itens.length) + '%';
+      const conv = deJob(job), nova = `${feitos}/${transcritos}/${job.status}`;
+      if (nova !== assinatura && conv.some(v => v.data)) {        // só redesenha quando algo mudou
+        assinatura = nova; TODOS = conv; EXEMPLO = false; render(true);
+        $('#baixar').hidden = job.status === 'rodando';
+      }
+      if (job.status !== 'rodando' && !job.transcrevendo) {
         if (job.status === 'erro') { erro(job.mensagem); status(''); }
         else { status(job.mensagem); $('#progresso').style.width = '100%'; render(); }
         break;
@@ -1222,6 +1367,7 @@ async function analisarPerfil() {
   rodando = false; $('#analisar').disabled = false;
 }
 $('#analisar').addEventListener('click', analisarPerfil);
+$('#baixar').addEventListener('click', baixarCSV);
 $('#perfil').addEventListener('keydown', e => { if (e.key === 'Enter') analisarPerfil(); });
 render();
 })();
