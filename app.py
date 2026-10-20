@@ -8,8 +8,7 @@ de links, em modo celular), lê views/curtidas/comentários/data de cada um e
 a página monta o laudo na hora: frequência, dia da semana, horário,
 duração dos vídeos, período do mês e mês a mês.
 
-Duração: lida do próprio arquivo de vídeo com o ffprobe (vem com o ffmpeg,
-só lê o cabeçalho, não baixa o vídeo inteiro); sem ffprobe, tenta achar no HTML.
+Duração: lida do próprio HTML da página do vídeo (sem baixar nada a mais).
 
 Proteções pra uso público:
   - FILA: no máximo COLETAS_SIMULTANEAS navegadores ao mesmo tempo; quem
@@ -40,10 +39,7 @@ COLETAS_SIMULTANEAS = int(os.environ.get("COLETAS_SIMULTANEAS", "2"))
 CACHE_HORAS = float(os.environ.get("CACHE_HORAS", "6"))
 MAX_POR_IP = int(os.environ.get("MAX_POR_IP", "2"))
 MAX_VIDEOS_TETO = 80
-TRABALHADORES_PAGINA = 8
-TRABALHADORES_DURACAO = 8
-SESSAO = requests.Session()
-SESSAO.mount("https://", requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16))
+TRABALHADORES_PAGINA = 4
 TEM_FFPROBE = shutil.which("ffprobe") is not None
 FUSO_BR = timezone(timedelta(hours=-3))
 HEADERS = {
@@ -175,11 +171,6 @@ def montar_driver(desktop=False):
     opcoes.add_argument("--no-sandbox")
     opcoes.add_argument("--disable-dev-shm-usage")
     opcoes.add_argument("--disable-gpu")
-    opcoes.add_argument("--disable-extensions")
-    opcoes.add_argument("--mute-audio")
-    opcoes.add_argument("--blink-settings=imagesEnabled=false")      # não baixa miniaturas: bem mais rápido
-    opcoes.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
-    opcoes.page_load_strategy = "eager"                               # não espera vídeos/imagens carregarem
     opcoes.add_argument("--window-size=1400,1000" if desktop else "--window-size=430,900")
     opcoes.add_argument(f"--user-data-dir=/tmp/chrome-perfil-{random.randint(1, 999999)}")
     opcoes.add_argument("user-agent=" + (HEADERS["User-Agent"] if desktop else
@@ -242,33 +233,13 @@ def extrair_info_perfil(texto, html):
     return info
 
 
-JS_CONTAR = "return document.querySelectorAll('a[href*=\"/video/\"]').length;"
-
-
-def _esperar_videos(driver, minimo, limite_s):
-    """Espera até aparecerem mais de `minimo` links de vídeo (ou estourar o tempo)."""
-    fim = time.time() + limite_s
-    while time.time() < fim:
-        try:
-            if (driver.execute_script(JS_CONTAR) or 0) > minimo:
-                return True
-        except Exception:
-            pass
-        time.sleep(0.25)
-    return False
-
-
 def _rolar(driver):
-    """Desce até o fim da grade e espera os próximos vídeos aparecerem (no máx. 4 s)."""
-    antes = driver.execute_script(JS_CONTAR) or 0
     altura = driver.execute_script("return window.innerHeight;") or 900
-    for _ in range(3):
-        driver.execute_script(f"window.scrollBy(0, {altura});")
+    for _ in range(6):
+        driver.execute_script(f"window.scrollBy(0, {altura // 2});")
         driver.execute_script("window.dispatchEvent(new Event('scroll'));")
-        time.sleep(0.2)
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    driver.execute_script("window.dispatchEvent(new Event('scroll'));")
-    _esperar_videos(driver, antes, 4)
+        time.sleep(0.5)
+    time.sleep(3)
 
 
 def ler_grade_do_perfil(url_perfil, conta, max_videos, avisar):
@@ -281,8 +252,7 @@ def ler_grade_do_perfil(url_perfil, conta, max_videos, avisar):
     try:
         avisar(f"Carregando o perfil @{conta}…")
         driver.get(url_perfil)
-        _esperar_videos(driver, 0, 12)          # segue assim que a grade aparece
-        time.sleep(0.5)
+        time.sleep(3)
         try:
             texto = driver.execute_script("return document.body.innerText;") or ""
             info.update(extrair_info_perfil(texto, driver.page_source or ""))
@@ -308,14 +278,14 @@ def ler_grade_do_perfil(url_perfil, conta, max_videos, avisar):
             if len(ids) >= max_videos:
                 break
             sem_novidade = sem_novidade + 1 if len(ids) == antes else 0
-            if sem_novidade >= 3:               # o perfil acabou: não fica rolando à toa
+            if sem_novidade >= 8:
                 break
             _rolar(driver)
 
         if "seguidores" not in info:
             try:
                 driver.execute_script("window.scrollTo(0, 0);")
-                time.sleep(0.5)
+                time.sleep(1)
                 texto = driver.execute_script("return document.body.innerText;") or ""
                 info.update(extrair_info_perfil(texto, driver.page_source or ""))
             except Exception:
@@ -332,18 +302,11 @@ def ler_grade_do_perfil(url_perfil, conta, max_videos, avisar):
 # 2) PÁGINA DO VÍDEO (requests): curtidas, comentários, legenda, data
 # ----------------------------------------------------------------------
 
-# mesma lista do robô do Colab (que acha o arquivo de vídeo em praticamente todas as páginas)
 PADROES_URL_VIDEO = [
     r'"photoUrl"\s*:\s*"([^"]+\.mp4[^"]*)"',
     r'"srcNoMark"\s*:\s*"([^"]+)"',
     r'"mainMvUrl"\s*:\s*"([^"]+)"',
     r'"playUrl"\s*:\s*"([^"]+)"',
-    r'"videoUrl"\s*:\s*"([^"]+)"',
-    r'"video_url"\s*:\s*"([^"]+)"',
-    r'"manifest"\s*:\s*"([^"]+\.m3u8[^"]*)"',
-    r'"url"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"',
-    r'"downloadUrl"\s*:\s*"([^"]+)"',
-    r'"h264Url"\s*:\s*"([^"]+)"',
     r'https?:[^\s"\'<>]+\.mp4[^\s"\'<>]*',
 ]
 
@@ -356,19 +319,10 @@ PADROES_CAMPOS = {
 }
 
 
-def _limpar_url_escapada(url):
-    if "\\u" in url:
-        try:
-            url = url.encode().decode("unicode_escape")
-        except UnicodeDecodeError:
-            url = url.replace("\\u002F", "/").replace("\\u0026", "&")
-    return url.replace("\\/", "/")
-
-
 def _url_video(html):
     for p in PADROES_URL_VIDEO:
         for m in re.findall(p, html):
-            url = _limpar_url_escapada(m)
+            url = m.replace("\\u002F", "/").replace("\\/", "/")
             if url.startswith("http") and (".mp4" in url or ".m3u8" in url):
                 return url
     return None
@@ -421,45 +375,19 @@ def _duracao_iso(html):
     return total if total > 0 else None
 
 
-def _ffprobe_segundos(alvo, remoto, limite_s):
-    cmd = ["ffprobe", "-v", "error"]
-    if remoto:
-        cmd += ["-rw_timeout", "6000000", "-user_agent", HEADERS["User-Agent"],
-                "-headers", f"Referer: {HEADERS['Referer']}\r\n"]
-    cmd += ["-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", alvo]
+def _duracao_ffprobe(url):
+    """Lê a duração direto do arquivo de vídeo (só o cabeçalho, é rápido)."""
+    if not (TEM_FFPROBE and url):
+        return None
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=limite_s)
+        r = subprocess.run(["ffprobe", "-v", "error", "-user_agent", HEADERS["User-Agent"],
+                            "-headers", f"Referer: {HEADERS['Referer']}\r\n",
+                            "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", url],
+                           capture_output=True, text=True, timeout=25)
         v = float(r.stdout.strip().split("\n")[0])
         return round(v) if v > 0 else None
     except Exception:
         return None
-
-
-def _duracao_ffprobe(url):
-    """1) Rápido: o ffprobe lê só o cabeçalho do vídeo direto do link.
-    2) Plano B (o jeito do robô do Colab): baixa o arquivo e mede localmente."""
-    if not (TEM_FFPROBE and url):
-        return None
-    d = _ffprobe_segundos(url, remoto=True, limite_s=10)
-    if d or ".m3u8" in url:
-        return d
-    caminho = f"/tmp/kwai_dur_{uuid.uuid4().hex[:10]}.mp4"
-    try:
-        with SESSAO.get(url, headers=HEADERS, stream=True, timeout=20) as r:
-            r.raise_for_status()
-            baixado = 0
-            with open(caminho, "wb") as f:
-                for pedaco in r.iter_content(1024 * 256):
-                    baixado += len(pedaco)
-                    if baixado > 150 * 1024 * 1024:        # vídeo grande demais: desiste
-                        return None
-                    f.write(pedaco)
-        return _ffprobe_segundos(caminho, remoto=False, limite_s=10)
-    except Exception:
-        return None
-    finally:
-        if os.path.exists(caminho):
-            os.remove(caminho)
 
 
 def _duracao_perto_do_id(html, video_id):
@@ -481,12 +409,12 @@ def _duracao_perto_do_id(html, video_id):
 
 
 def duracao_do_video(html, video_id):
-    """Só o que dá pra ler do HTML (instantâneo). O ffprobe roda depois, em segundo plano."""
+    """Só lê a duração do HTML que já foi baixado (instantâneo, sem baixar vídeo)."""
     return _duracao_iso(html) or _duracao_perto_do_id(html, video_id)
 
 
 def metricas_da_pagina(link, video_id):
-    r = SESSAO.get(link, headers=HEADERS, timeout=15)
+    r = requests.get(link, headers=HEADERS, timeout=25)
     html = r.text
     out = {"curtidas": None, "comentarios": None, "compartilhamentos": None,
            "views_pagina": None, "legenda": "", "data_publicacao": "", "hora_publicacao": None,
@@ -522,7 +450,6 @@ def metricas_da_pagina(link, video_id):
 
     out["data_publicacao"], out["hora_publicacao"], out["fonte_data"] = _data_publicacao(html, video_id)
     out["duracao"] = duracao_do_video(html, video_id)
-    out["url_video"] = _url_video(html)
     return out
 
 
@@ -577,7 +504,6 @@ def executar(job_id, url_perfil, conta, max_videos):
                    mensagem="Nenhum vídeo apareceu nesse perfil. Confira o link — perfis privados ou inexistentes não funcionam.")
         return
 
-    urls_video = {}
     itens = []
     for pos, c in enumerate(cards, start=1):
         views = contagem_para_int(c["views_texto"])
@@ -610,36 +536,13 @@ def executar(job_id, url_perfil, conta, max_videos):
                         item[k] = m[k]
                     if not item["titulo"]:
                         item["titulo"] = (m["legenda"] or "")[:120]
-                    urls_video[item["id_video"]] = m.get("url_video")
                     item["estado"] = "ok"
                 feitos += 1
                 JOBS[job_id]["mensagem"] = f"Lendo os vídeos: {feitos}/{len(itens)}"
 
-    faltando = [it for it in itens if not it.get("duracao") and urls_video.get(it["id_video"])] if TEM_FFPROBE else []
-    _atualizar(job_id, status="concluido", completando=bool(faltando),
-               mensagem=f"Pronto: {len(itens)} vídeo(s) de @{conta}." +
-                        (f" Lendo a duração dos vídeos: 0/{len(faltando)}…" if faltando else ""))
+    _atualizar(job_id, status="concluido", mensagem=f"Pronto: {len(itens)} vídeo(s) de @{conta}.")
     with TRAVA:
         CACHE[(conta.lower(), max_videos)] = (time.time(), job_id)
-    if not faltando:
-        return
-
-    # laudo já está na tela; a duração chega em seguida (ffprobe só lê o cabeçalho do vídeo)
-    feitos = 0
-    with ThreadPoolExecutor(max_workers=TRABALHADORES_DURACAO) as ex:
-        futuros = {ex.submit(_duracao_ffprobe, urls_video[it["id_video"]]): it for it in faltando}
-        for fut in as_completed(futuros):
-            it = futuros[fut]
-            try:
-                d = fut.result()
-            except Exception:
-                d = None
-            with TRAVA:
-                if d:
-                    it["duracao"] = d
-                feitos += 1
-                JOBS[job_id]["mensagem"] = f"Pronto: {len(itens)} vídeo(s) de @{conta}. Lendo a duração dos vídeos: {feitos}/{len(faltando)}…"
-    _atualizar(job_id, completando=False, mensagem=f"Pronto: {len(itens)} vídeo(s) de @{conta}.")
 
 
 def _limpar_antigos():
@@ -651,7 +554,7 @@ def _limpar_antigos():
         vivos = {jid for _, jid in CACHE.values()}
         for jid in list(JOBS):
             j = JOBS[jid]
-            if j["status"] != "rodando" and not j.get("completando") and jid not in vivos and j["criado"] < limite:
+            if j["status"] != "rodando" and jid not in vivos and j["criado"] < limite:
                 JOBS.pop(jid, None)
 
 
@@ -1472,7 +1375,7 @@ async function analisarPerfil() {
   const perfil = normPerfil($('#perfil').value);
   if (!perfil) { erro('Cole o link do perfil, por exemplo https://www.kwai.com/@Lulaoficial'); return; }
   if (!ROBO) { $('#sem-robo').hidden = false; erro(''); return; }
-  erro(''); rodando = true; $('#analisar').disabled = true; $('#baixar').hidden = true; let completandoVisto = false; $('#barra').hidden = false; $('#progresso').style.width = '4%';
+  erro(''); rodando = true; $('#analisar').disabled = true; $('#baixar').hidden = true; $('#barra').hidden = false; $('#progresso').style.width = '4%';
   status('Iniciando…', true);
   try {
     const r = await fetch('api/coletar', {method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -1480,17 +1383,13 @@ async function analisarPerfil() {
     const j = await r.json();
     if (!r.ok) throw new Error(j.erro || 'o servidor recusou o pedido');
     for (;;) {
-      await new Promise(ok => setTimeout(ok, 900));
+      await new Promise(ok => setTimeout(ok, 1200));
       const job = await (await fetch('api/job/' + j.job)).json();
       if (job.erro) throw new Error(job.erro);
       const itens = job.itens || [], feitos = itens.filter(i => i.estado !== 'pendente').length;
       $('#progresso').style.width = itens.length ? (15 + 85 * feitos / itens.length) + '%' : '10%';
       const conv = deJob(job);
       if (conv.some(v => v.data)) { TODOS = conv; EXEMPLO = false; render(true); }
-      if (job.status === 'concluido' && job.completando) {           // laudo pronto, duração chegando
-        if (!completandoVisto) { completandoVisto = true; render(); $('#baixar').hidden = false; $('#progresso').style.width = '100%'; }
-        status(job.mensagem, true); continue;
-      }
       if (job.status !== 'rodando') {
         if (job.status === 'erro') { erro(job.mensagem); status(''); }
         else { status(job.mensagem); $('#progresso').style.width = '100%'; render(); $('#baixar').hidden = false; }
